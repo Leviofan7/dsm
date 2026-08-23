@@ -1,0 +1,99 @@
+version: '3.8'
+
+services:
+  fastapi_backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: contextus_backend
+    restart: unless-stopped
+    shm_size: '2gb'
+    ipc: host
+    ports:
+      - "8000:8000"
+    environment:
+      - ALLOWED_TELEGRAM_USER_ID=${ALLOWED_TELEGRAM_USER_ID}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - PROJECT_ROOT=/app/project_workspace
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./backend:/app:rw              # ← ЖИВОЙ КОД: хост-правки мгновенно видны в контейнере
+      - ./:/app/project_workspace:rw
+      - /home/ai-line:/home/ai-line:rw
+      - ./backend/chroma_data:/app/chroma_data:rw
+      - ./backend/contextus.db:/app/contextus.db:rw
+      - claude_home:/root/.claude
+    depends_on:
+      - redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: contextus_tunnel
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - fastapi_backend
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: contextus_litellm
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    volumes:
+      - ./backend/config/litellm_config.yaml:/app/config.yaml:ro
+    command: [ "--config", "/app/config.yaml", "--port", "4000" ]
+
+  redis:
+    image: redis:alpine
+    container_name: contextus_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  agent_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: contextus_worker
+    restart: unless-stopped
+    shm_size: '2gb'
+    ipc: host
+    environment:
+      - ALLOWED_TELEGRAM_USER_ID=${ALLOWED_TELEGRAM_USER_ID}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - PROJECT_ROOT=/app/project_workspace
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./backend:/app:rw
+      - ./:/app/project_workspace:rw
+      - /home/ai-line:/home/ai-line:rw
+      - ./backend/chroma_data:/app/chroma_data:rw
+      - ./backend/contextus.db:/app/contextus.db:rw
+      - claude_home:/root/.claude
+    depends_on:
+      - redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: arq worker.WorkerSettings
+
+volumes:
+  chrome-profile:
+  claude_home:
+  redis_data:

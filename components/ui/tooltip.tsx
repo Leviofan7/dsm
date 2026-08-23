@@ -21,6 +21,10 @@ function Tooltip({ ...props }: TooltipPrimitive.Root.Props) {
   return <TooltipPrimitive.Root data-slot="tooltip" {...props} />
 }
 
+// Base UI не поддерживает asChild — Trigger всегда рендерит свой <button>.
+// Чтобы заменить элемент — используй render prop:
+//   <TooltipTrigger render={<MyButton />} />
+// Base UI сам передаёт все свои обработчики событий в render-элемент.
 function TooltipTrigger({ ...props }: TooltipPrimitive.Trigger.Props) {
   return <TooltipPrimitive.Trigger data-slot="tooltip-trigger" {...props} />
 }

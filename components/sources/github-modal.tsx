@@ -21,24 +21,25 @@ export function GithubModal({
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
-  onConnect: (repo: string, branch: string) => void
+  onConnect: (repo: string, branch: string, token: string) => Promise<void>
 }) {
   const [repo, setRepo] = useState("")
   const [branch, setBranch] = useState("main")
   const [token, setToken] = useState("")
   const [loading, setLoading] = useState(false)
 
-  function handleConnect() {
+  async function handleConnect() {
     if (!repo.trim()) return
     setLoading(true)
-    setTimeout(() => {
-      setLoading(false)
-      onConnect(repo.trim(), branch.trim() || "main")
+    try {
+      await onConnect(repo.trim(), branch.trim() || "main", token.trim())
       setRepo("")
       setBranch("main")
       setToken("")
       onOpenChange(false)
-    }, 1400)
+    } finally {
+      setLoading(false)
+    }
   }
 
   return (
@@ -98,8 +99,14 @@ export function GithubModal({
             Cancel
           </Button>
           <Button onClick={handleConnect} disabled={loading || !repo.trim()}>
-            {loading && <Loader2 className="size-4 animate-spin" />}
-            {loading ? "Verifying…" : "Verify & Connect"}
+            {loading ? (
+              <>
+                <Loader2 className="mr-2 size-4 animate-spin" />
+                Verifying…
+              </>
+            ) : (
+              "Verify & Connect"
+            )}
           </Button>
         </DialogFooter>
       </DialogContent>

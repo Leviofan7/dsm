@@ -29,9 +29,15 @@ const config: Record<
     text: "text-destructive",
     ring: "border-destructive/30 bg-destructive/10",
   },
+  ready: {
+    label: "Ready",
+    dot: "bg-green-500",
+    text: "text-green-600 dark:text-green-400",
+    ring: "border-green-500/30 bg-green-500/10",
+  },
 }
 
-export function StatusBadge({ status }: { status: SyncStatus }) {
+export function StatusBadge({ status, errorMessage }: { status: SyncStatus, errorMessage?: string | null }) {
   const c = config[status]
   return (
     <span
@@ -40,6 +46,7 @@ export function StatusBadge({ status }: { status: SyncStatus }) {
         c.ring,
         c.text,
       )}
+      title={errorMessage || undefined}
     >
       <span className={cn("size-1.5 rounded-full", c.dot)} />
       {c.label}

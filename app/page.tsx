@@ -15,11 +15,10 @@ export default function Page() {
             Connect and index the context your assistant can reason over.
           </p>
         </div>
-        <Button asChild variant="outline" size="sm">
-          <Link href="/chat">
-            Open Chat
-            <ArrowUpRight className="size-4" />
-          </Link>
+        {/* Base UI Button не поддерживает asChild — используем render prop */}
+        <Button variant="outline" size="sm" render={<Link href="/chat" />} nativeButton={false}>
+          Open Chat
+          <ArrowUpRight className="size-4" />
         </Button>
       </header>
 

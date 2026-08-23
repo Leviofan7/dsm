@@ -1,0 +1,209 @@
+# ═══════════════════════════════════════════════════════════════════
+# Contextus 2.0 — Central Model Registry
+# Единая матрица роутинга для всех задач системы.
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Провайдеры ────────────────────────────────────────────────────
+# Каждый провайдер описывает тип подключения и env-ключ для API.
+# type: ollama  → локальная модель через Ollama REST API
+# type: openai  → OpenAI-совместимый эндпоинт (DeepSeek, Gemini и т.д.)
+# type: anthropic → Anthropic Messages API
+providers:
+  ollama:
+    type: ollama
+    base_url_env: OLLAMA_URL          # default: http://localhost:11434
+    api_key_env: null                 # Ollama не требует ключа
+
+  deepseek:
+    type: openai                      # DeepSeek совместим с OpenAI SDK
+    base_url_env: DEEPSEEK_BASE_URL   # default: https://api.deepseek.com
+    api_key_env: DEEPSEEK_API_KEY
+
+  anthropic:
+    type: anthropic
+    base_url_env: null                # Стандартный https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+
+  gemini:
+    type: openai                      # Gemini через OpenAI-compatible proxy
+    base_url_env: GEMINI_BASE_URL     # default: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GEMINI_API_KEY
+
+# ── Модели ────────────────────────────────────────────────────────
+# Каждая модель привязана к провайдеру и содержит лимиты.
+models:
+  # --- Локальные (Ollama) ---
+  gemma4-e4b:
+    provider: ollama
+    model_id: "gemma4:e4b"
+    context_window: 8192
+    supports_tools: false             # Gemma4 e4b не поддерживает tool calling
+    supports_vision: true
+    tags: [fast, local, doorman]
+
+  llava:
+    provider: ollama
+    model_id: "llava:latest"
+    context_window: 4096
+    supports_tools: false
+    supports_vision: true
+    tags: [local, vision, fallback]
+
+  qwen-coder:
+    provider: ollama
+    model_id: "qwen3.6:27b"
+    context_window: 32768
+    supports_tools: true
+    supports_vision: false
+    tags: [local, coder, heavy]
+
+  omni-coder:
+    provider: ollama
+    model_id: "studiobrn/modOmniCoder:latest"
+    context_window: 32768
+    supports_tools: true
+    supports_vision: false
+    tags: [local, coder, react, sandbox]
+
+  supervisor-14b:
+    provider: ollama
+    model_id: "qwen2.5-coder:14b"
+    context_window: 32768
+    supports_tools: true
+    supports_vision: false
+    tags: [local, supervisor, qa, fast]
+
+  gemma4-26b:
+    provider: ollama
+    model_id: "gemma4:26b"
+    context_window: 32768
+    supports_tools: true
+    supports_vision: true
+    tags: [local, heavy, tools, vision, thinking]
+
+  gemma4:e4b:
+    provider: ollama
+    model_id: "gemma4:e4b"
+    context_window: 32768
+    supports_tools: true
+    supports_vision: true
+    tags: [local, heavy, tools, vision, thinking]
+
+  # --- Облачные ---
+  deepseek-chat:
+    provider: deepseek
+    model_id: "deepseek-chat"
+    context_window: 65536
+    supports_tools: true
+    supports_vision: false
+    tags: [cloud, coder, reasoning]
+
+  deepseek-reasoner:
+    provider: deepseek
+    model_id: "deepseek-reasoner"
+    context_window: 65536
+    supports_tools: false
+    supports_vision: false
+    tags: [cloud, reasoning, heavy]
+
+  claude-sonnet:
+    provider: anthropic
+    model_id: "claude-sonnet-4-20250514"
+    context_window: 200000
+    supports_tools: true
+    supports_vision: true
+    tags: [cloud, heavy, planner]
+
+  gemini-flash:
+    provider: gemini
+    model_id: "gemini-2.5-flash"
+    context_window: 1000000
+    supports_tools: true
+    supports_vision: true
+    tags: [cloud, fast, cheap]
+
+# ── Матрицы роутинга ──────────────────────────────────────────────
+# Для каждой задачи указан приоритетный список моделей.
+# Роутер идёт сверху вниз: если первая модель недоступна → fallback.
+routing:
+  doorman:
+    description: "Быстрая классификация входящих запросов"
+    chain:
+      - gemma4-e4b          # Приоритет: быстрая локальная
+      - gemini-flash         # Фолбек 1: дешёвый облачный
+      - deepseek-chat        # Фолбек 2
+
+  coding:
+    description: "Написание и анализ кода"
+    chain:
+      - qwen-coder           # Приоритет: локальная с tools + thinking
+      - gemma4-26b           # Фолбек 1: локальный кодер
+      - deepseek-chat        # Фолбек 2: облачный
+      - claude-sonnet        # Фолбек 3
+
+  rag:
+    description: "Ответы по базе знаний (RAG)"
+    chain:
+      - gemma4-26b           # Приоритет: тяжёлая локальная
+      - gemma4-e4b           # Фолбек 1: быстрая
+      - deepseek-chat        # Фолбек 2
+
+  planning:
+    description: "Архитектурное планирование сложных задач"
+    chain:
+      - gemma4-26b           # Приоритет: самая мощная локальная
+      - gemma4-26b           # Фолбек 1
+      - claude-sonnet        # Фолбек 2
+      - deepseek-reasoner    # Фолбек 3
+
+  vision:
+    description: "Анализ скриншотов и изображений"
+    chain:
+      - gemma4-e4b           # Приоритет: локальная vision
+      - llava                # Фолбек 1
+      - gemini-flash         # Фолбек 2: облачный vision
+
+  browser_automation:
+    description: "Задачи с использованием браузера (скрейпинг, навигация)"
+    chain:
+      - gemma4-26b           # Приоритет: локальная с tools + vision
+      - gemma4-e4b           # Фолбек 1: ещё тяжелее
+      - qwen-coder           # Фолбек 2
+      - gemini-flash         # Фолбек 3: облачный
+      - claude-sonnet        # Фолбек 4
+
+  research:
+    description: "Исследование и сбор информации"
+    chain:
+      - gemma4-26b           # Приоритет: локальная с tools
+      - qwen-coder           # Фолбек 1
+      - deepseek-chat        # Фолбек 2
+
+  general:
+    description: "Общие вопросы без специальных требований"
+    chain:
+      - gemma4-e4b           # Быстрая для простых вопросов
+      - gemma4-26b           # Фолбек 1: тяжёлая локальная
+      - gemini-flash         # Фолбек 2
+      - deepseek-chat        # Фолбек 3
+
+  meta_analyst:
+    description: "Ревизор — анализ логов и предложения по улучшению"
+    chain:
+      - claude-sonnet      # Приоритет: самая мощная
+      - deepseek-chat      # Фолбек 1
+      - gemma4-26b         # Фолбек 2: локальная тяжёлая
+
+  coder:
+    description: "ReAct-исполнитель: пишет код в изолированной песочнице, запрашивает разрешения"
+    chain:
+      - omni-coder         # Приоритет: специализированный OmniCoder
+      - qwen-coder         # Фолбек 1: qwen3.6 27b
+      - deepseek-chat      # Фолбек 2: облако
+
+  supervision:
+    description: "Надсмотрщик: анализирует ActionRequest от Кодера, пропускает безопасное и эскалирует опасное"
+    chain:
+      - supervisor-14b     # Приоритет: быстрый локальный 14B
+      - qwen-coder         # Фолбек 1: тяжёлый локальный
+      - gemini-flash       # Фолбек 2: быстрый облачный

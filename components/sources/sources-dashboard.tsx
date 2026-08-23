@@ -1,16 +1,16 @@
 "use client"
 
-import { useRef, useState } from "react"
+import { useRef, useState, useEffect } from "react"
 import {
   FileText,
   FolderOpen,
   GitBranch,
   Plus,
+  RefreshCw,
   Trash2,
   UploadCloud,
 } from "lucide-react"
 import {
-  connectedSources as initialSources,
   type ConnectedSource,
   type SourceType,
 } from "@/lib/data"
@@ -50,60 +50,102 @@ const typeMeta: Record<
 }
 
 export function SourcesDashboard() {
-  const [sources, setSources] = useState<ConnectedSource[]>(initialSources)
+  const [sources, setSources] = useState<ConnectedSource[]>([])
   const [githubOpen, setGithubOpen] = useState(false)
   const [folderOpen, setFolderOpen] = useState(false)
   const [dragging, setDragging] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [reindexingIds, setReindexingIds] = useState<Set<string>>(new Set())
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  function addSource(source: ConnectedSource) {
-    setSources((prev) => [source, ...prev])
+  async function fetchSources() {
+    try {
+      const res = await fetch("/api/sources")
+      if (res.ok) {
+        const data = await res.json()
+        setSources(data)
+      }
+    } catch (err) {
+      console.error("Failed to fetch sources", err)
+    } finally {
+      setLoading(false)
+    }
   }
 
-  function connectGithub(repo: string, branch: string) {
-    addSource({
-      id: `src_${Date.now()}`,
-      name: repo,
-      type: "github",
-      detail: `branch: ${branch}`,
-      files: Math.floor(Math.random() * 4000) + 200,
-      size: `${Math.floor(Math.random() * 400) + 20} MB`,
-      status: "indexing",
-      updatedAt: "now",
-    })
+  // Initial load and polling
+  useEffect(() => {
+    fetchSources()
+    const interval = setInterval(fetchSources, 4000)
+    return () => clearInterval(interval)
+  }, [])
+
+  async function connectGithub(repo: string, branch: string, token: string) {
+    try {
+      await fetch("/api/sources/github", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repo, branch, token }),
+      })
+      fetchSources()
+    } catch (err) {
+      console.error("Failed to connect github", err)
+    }
   }
 
-  function connectFolder(path: string) {
-    addSource({
-      id: `src_${Date.now()}`,
-      name: path.split("/").filter(Boolean).pop() ?? "Local folder",
-      type: "local",
-      detail: path,
-      files: Math.floor(Math.random() * 500) + 10,
-      size: `${Math.floor(Math.random() * 40) + 2} MB`,
-      status: "indexing",
-      updatedAt: "now",
-    })
+  async function connectFolder(path: string) {
+    try {
+      await fetch("/api/sources/local", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      })
+      fetchSources()
+    } catch (err) {
+      console.error("Failed to connect folder", err)
+    }
   }
 
   function addFiles(files: FileList | null) {
     if (!files) return
-    Array.from(files).forEach((file) => {
-      addSource({
-        id: `src_${Date.now()}_${file.name}`,
-        name: file.name,
-        type: "file",
-        detail: `${file.name.split(".").pop()?.toUpperCase() ?? "FILE"} · upload`,
-        files: 1,
-        size: `${(file.size / 1024 / 1024).toFixed(1)} MB`,
-        status: "queued",
-        updatedAt: "now",
-      })
-    })
+    // File upload logic to be implemented
   }
 
-  function disconnect(id: string) {
+  async function disconnect(id: string) {
+    // Optimistic UI update
     setSources((prev) => prev.filter((s) => s.id !== id))
+    try {
+      await fetch(`/api/sources/${id}`, {
+        method: "DELETE",
+      })
+      fetchSources()
+    } catch (err) {
+      console.error("Failed to delete source", err)
+      fetchSources() // Revert on failure
+    }
+  }
+
+  async function reindex(id: string) {
+    setReindexingIds((prev) => new Set(prev).add(id))
+    try {
+      const res = await fetch(`/api/sources/${id}/reindex`, { method: "POST" })
+      if (!res.ok) {
+        const err = await res.json()
+        alert(err.detail || "Reindex failed")
+        return
+      }
+      // Optimistically mark as indexing in UI
+      setSources((prev) =>
+        prev.map((s) => (s.id === id ? { ...s, status: "indexing" } : s))
+      )
+    } catch (err) {
+      console.error("Failed to reindex source", err)
+    } finally {
+      setReindexingIds((prev) => {
+        const next = new Set(prev)
+        next.delete(id)
+        return next
+      })
+    }
   }
 
   return (
@@ -210,11 +252,21 @@ export function SourcesDashboard() {
                 <TableHead className="hidden lg:table-cell">Files</TableHead>
                 <TableHead className="hidden sm:table-cell">Size</TableHead>
                 <TableHead>Status</TableHead>
+                <TableHead className="hidden xl:table-cell">Last Synced</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {sources.length === 0 && (
+              {loading ? (
+                <TableRow>
+                  <TableCell
+                    colSpan={6}
+                    className="h-24 text-center text-sm text-muted-foreground"
+                  >
+                    Loading sources...
+                  </TableCell>
+                </TableRow>
+              ) : sources.length === 0 ? (
                 <TableRow>
                   <TableCell
                     colSpan={6}
@@ -223,7 +275,7 @@ export function SourcesDashboard() {
                     No sources connected yet. Connect one above to get started.
                   </TableCell>
                 </TableRow>
-              )}
+              ) : null}
               {sources.map((source) => {
                 const meta = typeMeta[source.type]
                 const Icon = meta.icon
@@ -256,25 +308,60 @@ export function SourcesDashboard() {
                       {source.size}
                     </TableCell>
                     <TableCell>
-                      <StatusBadge status={source.status} />
+                      <StatusBadge status={source.status} errorMessage={source.error_message} />
+                    </TableCell>
+                    <TableCell className="hidden xl:table-cell text-xs text-muted-foreground tabular-nums">
+                      {source.updatedAt
+                        ? new Date(source.updatedAt).toLocaleString("ru", {
+                            day: "2-digit",
+                            month: "2-digit",
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })
+                        : "—"}
                     </TableCell>
                     <TableCell className="text-right">
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="size-8 text-muted-foreground hover:text-destructive"
-                            onClick={() => disconnect(source.id)}
+                      <div className="flex items-center justify-end gap-1">
+                        {source.type !== "local" && (
+                          <Tooltip>
+                            <TooltipTrigger
+                              render={
+                                <button
+                                  type="button"
+                                  disabled={source.status === "indexing" || source.status === "queued" || reindexingIds.has(source.id)}
+                                  className="size-8 inline-flex items-center justify-center rounded-md text-muted-foreground hover:text-primary hover:bg-muted transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                                  onClick={() => reindex(source.id)}
+                                />
+                              }
+                            >
+                              <RefreshCw className={`size-4 ${
+                                source.status === "indexing" || source.status === "queued"
+                                  ? "animate-spin"
+                                  : ""
+                              }`} />
+                              <span className="sr-only">Sync {source.name}</span>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              Re-index
+                            </TooltipContent>
+                          </Tooltip>
+                        )}
+                        <Tooltip>
+                          <TooltipTrigger
+                            render={
+                              <button
+                                type="button"
+                                className="size-8 inline-flex items-center justify-center rounded-md text-muted-foreground hover:text-destructive hover:bg-muted transition-colors"
+                                onClick={() => disconnect(source.id)}
+                              />
+                            }
                           >
                             <Trash2 className="size-4" />
-                            <span className="sr-only">
-                              Disconnect {source.name}
-                            </span>
-                          </Button>
-                        </TooltipTrigger>
-                        <TooltipContent>Disconnect</TooltipContent>
-                      </Tooltip>
+                            <span className="sr-only">Disconnect {source.name}</span>
+                          </TooltipTrigger>
+                          <TooltipContent>Disconnect</TooltipContent>
+                        </Tooltip>
+                      </div>
                     </TableCell>
                   </TableRow>
                 )

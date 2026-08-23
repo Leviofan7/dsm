@@ -22,7 +22,9 @@ function FileIcon({ path }: { path: string }) {
 
 export function Citations({ sources }: { sources: ContextChunk[] }) {
   return (
-    <Accordion type="single" collapsible className="mt-3">
+    // Base UI Accordion не имеет type="single" — управление через multiple={false} (дефолт)
+    // defaultValue указывает какой item открыт изначально
+    <Accordion defaultValue={[]} className="mt-3">
       <AccordionItem
         value="sources"
         className="overflow-hidden rounded-lg border border-border bg-background/40"
@@ -37,29 +39,32 @@ export function Citations({ sources }: { sources: ContextChunk[] }) {
           <div className="grid gap-2">
             {sources.map((chunk, i) => (
               <Tooltip key={i}>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    className="group rounded-md border border-border bg-card p-2.5 text-left transition-colors hover:border-primary/40 hover:bg-accent/40"
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex min-w-0 items-center gap-1.5">
-                        <FileIcon path={chunk.path} />
-                        <span className="truncate font-mono text-xs">
-                          {chunk.path}
-                        </span>
-                        <span className="shrink-0 text-xs text-muted-foreground">
-                          :{chunk.line}
-                        </span>
-                      </div>
-                      <span className="shrink-0 rounded-full border border-primary/30 bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-primary">
-                        {Math.round(chunk.score * 100)}% match
+                {/* render меняет тег, children вставляются внутрь */}
+                <TooltipTrigger
+                  render={
+                    <button
+                      type="button"
+                      className="group w-full rounded-md border border-border bg-card p-2.5 text-left transition-colors hover:border-primary/40 hover:bg-accent/40"
+                    />
+                  }
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <FileIcon path={chunk.path} />
+                      <span className="truncate font-mono text-xs">
+                        {chunk.path}
+                      </span>
+                      <span className="shrink-0 text-xs text-muted-foreground">
+                        :{chunk.line}
                       </span>
                     </div>
-                    <pre className="mt-1.5 overflow-x-auto whitespace-pre-wrap rounded bg-muted/60 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
-                      {chunk.quote}
-                    </pre>
-                  </button>
+                    <span className="shrink-0 rounded-full border border-primary/30 bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-primary">
+                      {Math.round(chunk.score * 100)}% match
+                    </span>
+                  </div>
+                  <pre className="mt-1.5 overflow-x-auto whitespace-pre-wrap rounded bg-muted/60 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
+                    {chunk.quote}
+                  </pre>
                 </TooltipTrigger>
                 <TooltipContent side="left" className="max-w-xs">
                   Retrieved from {chunk.path} (line {chunk.line})
