@@ -3,7 +3,8 @@ llm_manager.py — LLMManager (Model Registry + Intent Router + Tool Executor)
 
 Центральный компонент Contextus 2.0:
   1. При инициализации загружает models.yaml (Model Registry).
-  2. Опрашивает Ollama /api/tags для обнаружения локальных моделей.
+  2. Дополняет реестр моделями из таблицы model_catalog — то, что реально установлено
+     в Ollama (`/api/tags`), с метаданными из `/api/show` (tools / vision / context).
   3. Проверяет наличие API-ключей в окружении для облачных провайдеров.
   4. Doorman-роутер классифицирует запрос и выбирает модель по цепочке.
   5. Автоматический fallback — если модель недоступна или зависла.
@@ -12,9 +13,11 @@ llm_manager.py — LLMManager (Model Registry + Intent Router + Tool Executor)
 
 import json
 import os
+import re
 import asyncio
 import yaml
 import httpx
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any
@@ -22,12 +25,26 @@ import uuid
 
 import time
 from database import SessionLocal
-from models import AgentTask, AgentSubtask, ExecutionTrace
+from models import AgentTask, AgentSubtask, ExecutionTrace, ApprenticeStep, Source
 
 
-from .mcp_manager import MCPManager
+from .mcp_manager import (
+    MCPManager,
+    PRIVILEGED_TOOLS,
+    allowed_privileged_tools,
+    is_server_available,
+    known_server_names,
+    server_meta,
+)
+from .model_catalog import (
+    ensure_table as ensure_catalog_table,
+    fetch_ollama_models,
+    load_catalog_entries,
+    refresh_catalog,
+)
 from .session_state import session_manager, SessionState
 from services.dom_utils import calculate_dom_hash
+from services.role_permissions import CALLER_ROLE_META_KEY
 
 logger = logging.getLogger("contextus.llm_manager")
 
@@ -44,7 +61,7 @@ class ModelEntry:
     __slots__ = (
         "name", "provider_name", "provider_type", "model_id",
         "context_window", "supports_tools", "supports_vision",
-        "tags", "base_url", "api_key", "available",
+        "tags", "base_url", "api_key", "available", "source", "installed",
     )
 
     def __init__(self, name: str, cfg: dict, provider_cfg: dict):
@@ -72,6 +89,10 @@ class ModelEntry:
 
         # Availability flag — will be set during discovery
         self.available = False
+        # Откуда запись: "yaml" (курируемая из models.yaml) | "ollama" (найдена автоматически)
+        self.source = "yaml"
+        # Для локальных моделей — есть ли она сейчас в `ollama list`
+        self.installed = False
 
     def __repr__(self):
         status = "✅" if self.available else "❌"
@@ -79,15 +100,16 @@ class ModelEntry:
 
 
 class ModelRegistry:
-    """Загружает models.yaml и управляет доступностью моделей."""
+    """Загружает models.yaml + каталог обнаруженных моделей и управляет доступностью."""
 
     def __init__(self):
         self.models: dict[str, ModelEntry] = {}
         self.routing: dict[str, list[str]] = {}
         self._raw_config: dict = {}
+        self._catalog_loaded = False
 
     def load(self):
-        """Загрузка конфигурации из YAML."""
+        """Загрузка конфигурации из YAML и дополнение реестра моделями из БД."""
         if not _CONFIG_PATH.exists():
             logger.error(f"❌ Config not found: {_CONFIG_PATH}")
             return
@@ -110,68 +132,393 @@ class ModelRegistry:
         for task_name, task_cfg in routing_cfg.items():
             self.routing[task_name] = task_cfg.get("chain", [])
 
+        # Модели, установленные в Ollama и отсутствующие в YAML (таблица model_catalog)
+        self.merge_catalog()
+
         logger.info(f"  📋 Загружено моделей: {len(self.models)}, маршрутов: {len(self.routing)}")
 
-    async def discover_availability(self):
+    def yaml_ollama_model_ids(self) -> set[str]:
+        """model_id всех локальных моделей, описанных в models.yaml (их каталог не дублирует)."""
+        return {
+            entry.model_id
+            for entry in self.models.values()
+            if entry.provider_type == "ollama" and entry.source == "yaml"
+        }
+
+    def merge_catalog(self) -> int:
+        """
+        Добавляет в реестр модели из таблицы model_catalog (их нашла Ollama).
+
+        YAML приоритетнее: если model_id уже описан в models.yaml (например alias
+        `supervisor-14b` → `qwen2.5-coder:14b`), запись каталога пропускается, чтобы
+        в выпадающем списке не было дублей с разными именами.
+
+        Ошибка БД не должна ломать старт: каталог — дополнение к models.yaml,
+        без него система обязана подниматься.
+        """
+        added = 0
+        try:
+            ensure_catalog_table()
+            providers = self._raw_config.get("providers", {})
+            provider_cfg = providers.get("ollama", {"type": "ollama"})
+            known_model_ids = self.yaml_ollama_model_ids()
+
+            for name, cfg in load_catalog_entries().items():
+                if name in self.models or cfg["model_id"] in known_model_ids:
+                    continue
+                entry = ModelEntry(name, cfg, provider_cfg)
+                entry.source = "ollama"
+                entry.installed = bool(cfg.get("installed", True))
+                self.models[name] = entry
+                added += 1
+
+            if added:
+                logger.info(f"  🧩 Из каталога Ollama добавлено моделей: {added}")
+            self._catalog_loaded = True
+        except Exception as e:
+            logger.error(f"⚠️ Не удалось прочитать каталог моделей: {e}")
+        return added
+
+    async def discover_availability(self, deep: bool = False):
         """
         Проверяет доступность каждой модели:
-        - Ollama: запрос к /api/tags
+        - Ollama: /api/tags → синхронизация каталога в БД + флаг installed
         - Cloud: проверка наличия API-ключа
+
+        deep=True — переопросить /api/show у всех локальных моделей (обновилась Ollama).
         """
         logger.info("╔══════════════════════════════════════════╗")
         logger.info("║   Model Registry — ОБНАРУЖЕНИЕ          ║")
         logger.info("╚══════════════════════════════════════════╝")
 
-        # 1. Получаем список моделей от Ollama
-        ollama_models: set[str] = set()
-        ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+        # 1. Каталог: что реально установлено в Ollama (+ метаданные из /api/show)
+        ollama_models: set[str] | None = None
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(f"{ollama_url}/api/tags")
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for m in data.get("models", []):
-                        ollama_models.add(m.get("name", ""))
-                    logger.info(f"  🟢 Ollama доступна. Моделей в Ollama: {len(ollama_models)}")
-                else:
-                    logger.warning(f"  🟡 Ollama ответила {resp.status_code}")
+            result = await refresh_catalog(
+                deep=deep,
+                skip_model_ids=self.yaml_ollama_model_ids(),
+            )
+            ollama_models = result["installed"] if result["ok"] else None
+            if result["ok"]:
+                self.merge_catalog()  # новые модели сразу доступны в UI без рестарта
         except Exception as e:
-            logger.warning(f"  🔴 Ollama недоступна: {e}")
+            # Каталог — надстройка над models.yaml: сбой записи в БД не должен мешать
+            # системе подняться. Доступность локальных моделей выясняем напрямую.
+            logger.error(f"⚠️ Синхронизация каталога моделей не удалась: {e}")
+            tags = await fetch_ollama_models()
+            ollama_models = {m.get("name", "") for m in tags} if tags is not None else None
 
         # 2. Проставляем доступность каждой модели
         for name, entry in self.models.items():
             if entry.provider_type == "ollama":
-                # Проверяем точное совпадение model_id в списке Ollama
-                entry.available = entry.model_id in ollama_models
-                status = "✅ найдена" if entry.available else "❌ не найдена в Ollama"
+                # Точное совпадение model_id в списке Ollama
+                entry.available = ollama_models is not None and entry.model_id in ollama_models
+                entry.installed = entry.available
+                if ollama_models is None:
+                    status = "🔴 Ollama недоступна"
+                else:
+                    status = "✅ найдена" if entry.available else "❌ не найдена в Ollama"
                 logger.info(f"  [{name}] {entry.model_id} → {status}")
             else:
                 # Облачные: доступны, если есть API-ключ
                 entry.available = bool(entry.api_key)
+                entry.installed = False
                 status = "✅ ключ есть" if entry.available else "❌ API-ключ не задан"
                 logger.info(f"  [{name}] {entry.provider_type}/{entry.model_id} → {status}")
 
         logger.info("  ─────────────────────────────────────────")
 
-    def resolve_model(self, task: str) -> ModelEntry | None:
+    def resolve_model(
+        self,
+        task: str,
+        complexity: str = "auto",
+        model_override: str | None = None,
+        model_overrides: list[str] | None = None,
+    ) -> ModelEntry | None:
         """
         Выбирает первую доступную модель из цепочки для задачи.
-        Это и есть автоматический fallback.
+        Учитывает model_override / model_overrides и complexity.
+
+        model_overrides — приоритетный список моделей из настроек агента
+        (agent_configs.json). Кандидаты проверяются по порядку: берётся первая
+        существующая в реестре и доступная модель, остальные пропускаются с логом.
         """
+        candidates = [
+            m for m in (model_overrides or ([model_override] if model_override else [])) if m
+        ]
+
+        for candidate in candidates:
+            entry = self.models.get(candidate)
+            if entry and entry.available:
+                if candidate != candidates[0]:
+                    logger.info(f"  ↪️ Использую '{candidate}' (предыдущие кандидаты недоступны).")
+                return entry
+            if entry:
+                logger.warning(f"  ⚠️ Кандидат '{candidate}' недоступен (нет API-ключа или модели в Ollama), пробую следующий.")
+            else:
+                logger.warning(f"  ⚠️ Кандидат '{candidate}' отсутствует в models.yaml, пропускаю.")
+
+        if candidates:
+            logger.warning("  ⚠️ Ни один кандидат из настроек агента недоступен, использую цепочку маршрутизации.")
+
         chain = self.routing.get(task, self.routing.get("general", []))
+
+        # Фильтра по типу провайдера здесь НЕТ осознанно. И light-, и heavy-цепочки
+        # задаются явно в config/agent_configs.json (light — смешанная, локальная первой;
+        # heavy — облачная), а routing — общий fallback. Раньше light принудительно
+        # ограничивался ollama, heavy — облаком, из-за чего первый локальный кандидат
+        # heavy-цепочки молча терялся.
         for model_name in chain:
             entry = self.models.get(model_name)
             if entry and entry.available:
                 return entry
-        logger.error(f"  ❌ Ни одна модель не доступна для задачи '{task}'")
+
+        logger.error(f"  ❌ Ни одна модель не доступна для задачи '{task}' (complexity={complexity})")
         return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Agent config (config/agent_configs.json)
+# ═══════════════════════════════════════════════════════════════════
+
+AGENT_CONFIGS_PATH = _BACKEND_DIR / "config" / "agent_configs.json"
+
+
+def extract_model_candidates(conf: dict | None) -> list[str]:
+    """
+    Достаёт приоритетный список моделей из конфига агента.
+    Новый формат: {"models": ["deepseek-chat", "gemini-flash"]}
+    Legacy-формат: {"model": "deepseek-chat"}
+    """
+    if not isinstance(conf, dict):
+        return []
+
+    raw = conf.get("models")
+    if isinstance(raw, list):
+        return [m.strip() for m in raw if isinstance(m, str) and m.strip()]
+
+    legacy = conf.get("model")
+    if isinstance(legacy, str) and legacy.strip():
+        return [legacy.strip()]
+
+    return []
+
+
+def load_agent_configs() -> dict:
+    """Читает config/agent_configs.json. Пустой dict, если файла нет или он битый."""
+    if not AGENT_CONFIGS_PATH.exists():
+        return {}
+    try:
+        with open(AGENT_CONFIGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.error(f"Ошибка загрузки agent_configs.json: {e}")
+        return {}
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Гибридное определение сложности (light / heavy)
+# ═══════════════════════════════════════════════════════════════════
+
+#: Роли, для которых режим известен заранее — эвристика для них не считается.
+#: Имена должны совпадать с id ролей из roles/*.yaml (тот же источник, из которого
+#: резолвер получает agent_id). Проверяется validate_role_defaults().
+ROLE_DEFAULTS: dict[str, str] = {
+    "coder": "light",
+    "doorman": "light",
+    "web_researcher": "light",
+    "news_extractor": "light",
+    "tester": "light",
+    "code_architect": "heavy",
+    "supervisor_14b": "heavy",
+    "meta_analyst": "heavy",
+}
+
+#: Порог эвристики: столько «тяжёлых» сигналов и больше → heavy
+HEAVY_SIGNAL_THRESHOLD = 2
+
+#: Сигналы тяжёлой задачи. Считаются локально по тексту запроса — без вызова моделей.
+_HEAVY_SIGNALS: list[tuple[str, "re.Pattern"]] = [
+    ("архитектура/рефакторинг", re.compile(
+        r"архитектур|рефактор|миграц|переписать|микросервис|оркестр|интеграц|схем[аеы] |структур[аеу]", re.I)),
+    ("несколько файлов", re.compile(
+        r"нескольк|\bвсе\b|весь проект|по всему|сквозн|end[- ]?to[- ]?end|\be2e\b|пакетн", re.I)),
+    ("высокая цена ошибки", re.compile(
+        r"прод|production|боев|деплой|deploy|критичн|без ошибок|аккуратно|нагрузк|безопасн", re.I)),
+    ("много шагов", re.compile(r"\d+\s*(шаг|этап|step)|\(1\)|1\)\s|сначала.*затем|шаг\s*\d", re.I)),
+    ("явное планирование", re.compile(
+        r"план|спецификаци|пошагов|разбей|декомпозиц|алгоритм целиком|аудит", re.I)),
+]
+
+
+def heuristic_complexity(query: str | None) -> tuple[str, int, list[str]]:
+    """
+    Локальная оценка сложности запроса (без вызовов моделей).
+    Порог: HEAVY_SIGNAL_THRESHOLD сигналов и больше → heavy, иначе light.
+    Возвращает (уровень, скор, сработавшие сигналы).
+    """
+    text = (query or "").strip()
+    if not text:
+        return "light", 0, []
+
+    hits = [label for label, pattern in _HEAVY_SIGNALS if pattern.search(text)]
+    score = len(hits)
+    return ("heavy" if score >= HEAVY_SIGNAL_THRESHOLD else "light"), score, hits
+
+
+def resolve_agent_mode(agent_id: str, complexity: str, query: str | None = None) -> tuple[str, str]:
+    """
+    Режим агента для complexity="auto": explicit → role_default → heuristic.
+    Одна ветка, без слияния heavy+light, без вызовов моделей.
+
+    explicit — вызывающий уже сказал light/heavy;
+    role_default — режим закреплён за ролью в ROLE_DEFAULTS;
+    heuristic — сигналы в тексте запроса.
+    """
+    if complexity in ("light", "heavy"):
+        return complexity, "explicit"
+
+    default = ROLE_DEFAULTS.get((agent_id or "").strip())
+    if default:
+        return default, "role_default"
+
+    level, score, hits = heuristic_complexity(query)
+    logger.info(
+        f"  🧩 [{agent_id}] complexity={level} "
+        f"(heuristic: score={score} из {len(_HEAVY_SIGNALS)}"
+        + (f", signals: {', '.join(hits)}" if hits else "")
+        + ")"
+    )
+    return level, "heuristic"
+
+
+def known_roles() -> set[str]:
+    """
+    Роли из ТОГО ЖЕ источника, что использует резолвер: id роли приходит либо из
+    roles/<id>.yaml (Planner / Doorman / UI), либо ключом agent_configs.json.
+    """
+    roles = {p.stem for p in (_BACKEND_DIR / "roles").glob("*.yaml")}
+    roles |= set(load_agent_configs().keys())
+    return roles
+
+
+def validate_role_defaults(role_defaults: dict[str, str] | None = None) -> list[str]:
+    """
+    Проверяет, что ROLE_DEFAULTS ссылается только на существующие роли.
+    Возвращает список проблем и ПИШЕТ WARNING (не raise): ошибочный дефолт — это повод
+    уйти в эвристику, а не уронить старт системы.
+    """
+    defaults = ROLE_DEFAULTS if role_defaults is None else role_defaults
+    known = known_roles()
+    problems: list[str] = []
+    for role, level in defaults.items():
+        if role not in known:
+            problems.append(f"ROLE_DEFAULTS['{role}']: роли нет ни в roles/*.yaml, ни в agent_configs.json")
+        if level not in ("light", "heavy"):
+            problems.append(f"ROLE_DEFAULTS['{role}']: недопустимый уровень '{level}'")
+    for problem in problems:
+        logger.warning(f"  ⚠️ {problem}")
+    return problems
+
+
+def validate_roles_config_sync() -> list[str]:
+    """
+    Отдельная проверка синхронизации roles/*.yaml ↔ agent_configs.json
+    (намеренно НЕ внутри validate_role_defaults): настройки агента без файла роли
+    никогда не будут применены.
+    """
+    known_files = {p.stem for p in (_BACKEND_DIR / "roles").glob("*.yaml")}
+    problems = [
+        f"agent_configs.json['{key}'] без roles/{key}.yaml — настройки не применятся"
+        for key in load_agent_configs()
+        if key not in known_files
+    ]
+    for problem in problems:
+        logger.warning(f"  ⚠️ {problem}")
+    return problems
+
+
+def resolve_agent_decision(
+    registry: "ModelRegistry",
+    agent_id: str,
+    complexity: str,
+    model_override: str | None = None,
+    query: str | None = None,
+) -> tuple["ModelEntry | None", dict, str, str]:
+    """
+    Решение о модели агента целиком: (model, conf, mode, reason).
+
+    mode/reason нужны вызывающим: без них не видно, ПОЧЕМУ выбрана модель,
+    и оркестратор начинает обходить резолвер своим `registry.resolve_model(role)`.
+    """
+    mode, reason = resolve_agent_mode(agent_id, complexity, query)
+    if complexity not in ("light", "heavy"):
+        logger.info(f"  🧩 [{agent_id}] auto → {mode} ({reason})")
+
+    conf = get_agent_mode_config(load_agent_configs(), agent_id, mode)
+    candidates = ([model_override] if model_override else []) + extract_model_candidates(conf)
+    model = registry.resolve_model(agent_id, complexity=mode, model_overrides=candidates)
+    return model, conf, mode, reason
+
+
+def resolve_agent_model(
+    registry: "ModelRegistry",
+    agent_id: str,
+    complexity: str,
+    model_override: str | None = None,
+    query: str | None = None,
+) -> tuple["ModelEntry | None", dict]:
+    """
+    Модель агента и конфиг выбранного режима (config/agent_configs.json).
+
+    Тонкая обёртка над resolve_agent_decision (оставлена ради совместимости
+    2-элементного контракта). Мержа heavy+light здесь нет: режим выбирает
+    resolve_agent_mode, после чего берётся РОВНО одна цепочка. Настройки агента
+    приоритетнее цепочки routing из models.yaml: модель выбрал человек.
+    """
+    model, conf, _mode, _reason = resolve_agent_decision(
+        registry, agent_id, complexity, model_override, query=query
+    )
+    return model, conf
+
+
+def get_agent_mode_config(agent_configs: dict, agent_id: str, complexity: str) -> dict:
+    """
+    Возвращает настройки агента для режима light/heavy.
+
+    ВАЖНО: резолвер моделей больше НЕ использует ветку "auto" (там был мерж heavy+light):
+    режим определяет resolve_agent_mode. Мерж остался только для обратной совместимости
+    внешних вызовов и помечен как deprecated.
+    """
+    agent_conf = agent_configs.get(agent_id) or {}
+    if not isinstance(agent_conf, dict):
+        return {}
+
+    if complexity in ("light", "heavy"):
+        mode_conf = agent_conf.get(complexity)
+        return mode_conf if isinstance(mode_conf, dict) else {}
+
+    merged: dict[str, list[str]] = {"models": [], "extra_mcps": []}
+    for mode in ("heavy", "light"):
+        mode_conf = agent_conf.get(mode)
+        if not isinstance(mode_conf, dict):
+            continue
+        merged["models"].extend(extract_model_candidates(mode_conf))
+        extra = mode_conf.get("extra_mcps")
+        if isinstance(extra, list):
+            merged["extra_mcps"].extend([s for s in extra if isinstance(s, str) and s.strip()])
+
+    # Дедуп с сохранением порядка: одна и та же модель/сервер часто указаны и в heavy,
+    # и в light — без этого в allowed_servers приезжали дубли (deepseek-harness ×2, web-stealth ×2).
+    merged["models"] = list(dict.fromkeys(merged["models"]))
+    merged["extra_mcps"] = list(dict.fromkeys(merged["extra_mcps"]))
+    return merged
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  LLMManager
 # ═══════════════════════════════════════════════════════════════════
-
-import re
 
 class LLMManager:
     """
@@ -193,7 +540,17 @@ class LLMManager:
         self.mcp = MCPManager()
         self._initialized = False
         self._last_analyst_run: dict[str, float] = {}  # task_type -> timestamp
-        # TODO(rate-limit): refine key to (task_type, error_sig) if false-negatives observed in production
+        self._refresh_task: asyncio.Task | None = None
+
+    async def _refresh_loop(self):
+        interval = int(os.getenv("MODEL_REFRESH_INTERVAL", 60))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self.registry.discover_availability()
+                logger.debug("🔄 Model Registry фоновое обновление завершено")
+            except Exception as e:
+                logger.error(f"⚠️ Ошибка в фоновом обновлении моделей: {e}")
 
     async def initialize(self):
         """Полная инициализация: загрузка конфига, обнаружение, запуск MCP."""
@@ -212,14 +569,98 @@ class LLMManager:
 
         # 3. Запуск MCP-серверов
         await self.mcp.start()
+        
+        # 4. Запуск фонового обновления моделей
+        self._refresh_task = asyncio.create_task(self._refresh_loop())
+
+        # 5. Готовность песочницы (git-worktree) — Gate 2.0 без неё не сможет применять патчи
+        try:
+            from services.sandbox import (
+                PROJECT_ROOT as sandbox_root,
+                auto_checkpoint_enabled,
+                ensure_safe_directory,
+                project_repo_ready,
+            )
+            ensure_safe_directory(sandbox_root)
+            ready, why = project_repo_ready()
+            if ready:
+                logger.info(
+                    f"  🧪 Sandbox: git-worktree готов ({sandbox_root})"
+                    f" | auto_checkpoint={auto_checkpoint_enabled()}"
+                )
+            else:
+                logger.warning(f"  ⚠️ Sandbox недоступна: {why}")
+        except Exception as e:
+            logger.warning(f"  ⚠️ Не удалось проверить песочницу: {e}")
+
+        # 6. Предупреждения по настройкам агентов (модели/провайдеры/MCP)
+        self._log_agent_config_warnings()
 
         self._initialized = True
         logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         logger.info("  ✅ LLMManager полностью инициализирован")
         logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
+    def _log_agent_config_warnings(self):
+        """
+        Диагностика на старте (ТЗ 4.9): какие модели/провайдеры/MCP-серверы из настроек
+        агентов сейчас недоступны. Это деградация с fallback, а не ошибка — но её надо видеть
+        до первого запроса, а не в логе конкретного диалога.
+        """
+        provider_ok: dict[str, bool] = {}
+        for entry in self.registry.models.values():
+            provider_ok[entry.provider_name] = provider_ok.get(entry.provider_name, False) or entry.available
+
+        dead_providers = sorted(p for p, ok in provider_ok.items() if not ok)
+        if dead_providers:
+            logger.warning(
+                f"  ⚠️ Провайдеры недоступны: {', '.join(dead_providers)} — "
+                "модели этих провайдеров пропускаются, используется fallback по цепочке routing."
+            )
+
+        configs = load_agent_configs()
+        known_servers = set(known_server_names())
+        for agent_id, agent_conf in (configs or {}).items():
+            if not isinstance(agent_conf, dict):
+                continue
+            servers: set[str] = set()
+            for mode in ("light", "heavy"):
+                mode_conf = agent_conf.get(mode)
+                if not isinstance(mode_conf, dict):
+                    continue
+                for candidate in extract_model_candidates(mode_conf):
+                    entry = self.registry.models.get(candidate)
+                    if entry is None:
+                        logger.warning(f"  ⚠️ [{agent_id}/{mode}] модели нет в реестре: {candidate} → пропуск")
+                    elif not entry.available:
+                        logger.warning(f"  ⚠️ [{agent_id}/{mode}] модель недоступна: {candidate} → fallback на routing")
+                servers.update([s for s in (mode_conf.get("extra_mcps") or []) if isinstance(s, str)])
+
+            for name in sorted(servers):
+                if name not in known_servers:
+                    logger.warning(f"  ⚠️ [{agent_id}] MCP-сервер '{name}' не найден в mcp_servers/ → игнорируется")
+                elif not is_server_available(name):
+                    bin_name = server_meta(name).get("requires_bin")
+                    logger.warning(f"  ⚠️ [{agent_id}] MCP-сервер '{name}' недоступен (нет '{bin_name}') → инструменты исключены")
+
+        # Гибридный резолвер: дефолтные режимы ролей + синхронизация ролей и конфигов
+        validate_role_defaults()
+        validate_roles_config_sync()
+
+        # Фаза A: permission-envelope ролей (write_scope / intent_access / can_create_intent)
+        # Держим импорт локальным: permissions — данные, а не зависимость ядра
+        from services.role_permissions import validate_intent_access_consistency, validate_role_permissions, validate_write_scope_consistency
+        from agent.mcp_manager import GATE_TOOLS_BY_ROLE
+        validate_role_permissions()
+        # Фаза A.1: декларация write_scope ↔ фактическая выдача write-тулов
+        validate_write_scope_consistency(GATE_TOOLS_BY_ROLE)
+        # Фаза B: intent_access / can_create_intent ↔ tools роли
+        validate_intent_access_consistency()
+
     async def shutdown(self):
         """Graceful shutdown."""
+        if self._refresh_task:
+            self._refresh_task.cancel()
         await self.mcp.shutdown()
         self._initialized = False
 
@@ -239,6 +680,11 @@ class LLMManager:
             "из интернета", "в инете", "поищи", "ищи", "нагугли",
             "прогугли", "search", "google", "найти инфу", "дай инфу",
             "узнай", "выясни", "разузнай", "покажи инфу",
+            # Новости и текущие события: слов «найди/поищи» нет, но это всё равно research —
+            # иначе запрос уходит в general и на нём отвечает слабая лёгкая модель по памяти
+            # (инцидент 26.09: «Новости по прилетам НПЗ…» → выдуманные «СГК» и удары по «ОДКБ»).
+            "новост", "сводка", "что нового", "что случилось", "последние события",
+            "хроника", "прилёт", "прилет", "удар по", "удары по", "обстрел", "атака на",
         ]
         _BROWSER_KEYWORDS = [
             "зайди на сайт", "открой сайт", "перейди на", "открой страницу",
@@ -254,7 +700,13 @@ class LLMManager:
             return {"task_type": "browser_automation", "role": "default", "complexity": "low"}
 
         # ── LLM Doorman (для неочевидных случаев) ─────────────────
-        model = self.registry.resolve_model("doorman")
+        # Модель — тем же резолвером, что и остальные роли (agent_configs.json → ROLE_DEFAULTS).
+        # Раньше здесь стоял прямой `registry.resolve_model("doorman")`: последний оставшийся
+        # обход резолвера, из-за которого маршрутизатор всегда работал на слабой локальной модели
+        # (26.09: новостной запрос классифицировала deepseek-r1:8b).
+        model, _conf, _mode, _reason = resolve_agent_decision(self.registry, "doorman", "auto", None, query=query)
+        if not model:
+            model = self.registry.resolve_model("doorman")  # последний резерв: routing-цепочка models.yaml
         if not model:
             return {"task_type": "general", "role": "default", "complexity": "low", "error": "no doorman model"}
 
@@ -266,7 +718,12 @@ class LLMManager:
             '  "role": "news_extractor|code_architect|default",\n'
             '  "complexity": "low|high"\n'
             "}\n\n"
+            "Ты НЕ отвечаешь на вопрос, не рассуждаешь о содержании и не строишь предположений — "
+            "только категория.\n"
+            "ВАЖНО: Новости, свежие события, происшествия, конкретные даты, цифры, ущерб, потери — "
+            "task_type ОБЯЗАТЕЛЬНО 'research', даже если слов «найди/поищи» в запросе нет.\n"
             "ВАЖНО: Если пользователь просит найти, узнать или поискать информацию — task_type ОБЯЗАТЕЛЬНО 'research'.\n"
+            "Если сомневаешься между 'general' и 'research' — выбирай 'research'.\n"
             "Если пользователь просит зайти на конкретный сайт — task_type 'browser_automation'.\n"
             "Если задача связана с написанием кода, скриптов, SQL, настройкой серверов, фоновыми задачами, cron или системным администрированием — task_type ОБЯЗАТЕЛЬНО 'coding'.\n\n"
             f"Контекст: {context}\n"
@@ -306,16 +763,100 @@ class LLMManager:
             return {"task_type": "general", "role": "default", "complexity": "low", "error": str(e)}
 
 
+    def _resolve_allowed_servers(self, servers: list[str] | None, model: "ModelEntry | None" = None) -> list[str]:
+        """
+        Оставляет только реально доступные MCP-серверы.
+
+        CLI-движки (Gemini CLI, DeepSeek harness) требуют своего провайдера и
+        бинарника: если чего-то нет — инструменты исключаются с записью в лог,
+        а не приводят к ошибке. Несовпадение провайдера модели агента с CLI-движком
+        ошибкой не считается: движок делает собственный независимый инференс.
+        """
+        known = known_server_names()
+        known_set = set(known)
+        # None означает «все серверы» (legacy-путь) — разворачиваем в явный список
+        servers = known if servers is None else servers
+
+        provider_available: dict[str, bool] = {}
+        for entry in self.registry.models.values():
+            provider_available[entry.provider_name] = (
+                provider_available.get(entry.provider_name, False) or entry.available
+            )
+
+        resolved: list[str] = []
+        for name in servers:
+            if name not in known_set:
+                logger.warning(f"  ⚠️ MCP-сервер '{name}' не найден в mcp_servers/, пропускаю.")
+                continue
+
+            meta = server_meta(name)
+            required_provider = meta.get("required_provider")
+
+            if required_provider and not provider_available.get(required_provider, False):
+                logger.info(f"  ℹ️ MCP '{name}' исключён: провайдер '{required_provider}' недоступен.")
+                continue
+
+            if not is_server_available(name):
+                logger.info(f"  ℹ️ MCP '{name}' исключён: бинарник '{meta.get('requires_bin')}' не найден в PATH.")
+                continue
+
+            if required_provider and model and model.provider_name != required_provider:
+                logger.info(
+                    f"  ℹ️ MCP '{name}' работает через свой провайдер '{required_provider}' "
+                    f"(модель агента — '{model.provider_name}'): это отдельный инференс."
+                )
+
+            resolved.append(name)
+
+        return resolved
+
+    def _resolve_role_target(
+        self,
+        role: str,
+        query: str = "",
+        *,
+        complexity: str = "auto",
+        base_servers: list[str] | None = None,
+        model_override: str | None = None,
+    ) -> tuple["ModelEntry | None", dict, list[str], str, str]:
+        """
+        Единая точка выбора модели и MCP-серверов для роли на любом пути исполнения
+        (планировщик → подзадачи, воркер, Telegram).
+
+        Режим light/heavy решает resolve_agent_mode (explicit → ROLE_DEFAULTS → эвристика
+        по тексту задачи), серверы = базовые + `extra_mcps` выбранного режима из
+        config/agent_configs.json. Раньше пути исполнения звали `registry.resolve_model(role)`
+        напрямую: настройки роли не применялись вообще, а роль оставалась без своих MCP.
+
+        Возвращает (model, conf, servers, mode, reason) — reason нужен для лога/тестов.
+        """
+        model, conf, mode, reason = resolve_agent_decision(
+            self.registry, role, complexity, model_override, query=query
+        )
+
+        if base_servers is None:
+            # None = legacy-политика «все доступные серверы» (Telegram-путь).
+            # extra_mcps роли тут добавить нечего: полный список и так всё включает.
+            servers: list[str] | None = None
+        else:
+            merged = list(base_servers)
+            extra = conf.get("extra_mcps") if isinstance(conf, dict) else None
+            if isinstance(extra, list):
+                merged.extend([s for s in extra if isinstance(s, str) and s.strip()])
+            servers = list(dict.fromkeys(merged)) or None
+
+        resolved = self._resolve_allowed_servers(servers, model)
+        logger.info(
+            f"  🧩 [{role}] режим={mode} ({reason}) → модель {getattr(model, 'name', None)}; "
+            f"серверы: {resolved}"
+        )
+        return model, conf, resolved, mode, reason
+
     async def execute_apprentice_step(self, session_id: str, proposed_tool: str | None, proposed_args: dict | None, proposed_reasoning: str, proposed_response_text: str | None) -> dict:
         """
         Создает ApprenticeStep и ждет решения человека.
         Возвращает {'decision': '...', 'corrected_args': ...}
         """
-        from database import SessionLocal
-        from models import ApprenticeStep
-        import json
-        import asyncio
-        
         db = SessionLocal()
         try:
             step = ApprenticeStep(
@@ -362,6 +903,8 @@ class LLMManager:
         task_id: str | None = None,
         target_agent: str | None = None,
         mode: str | None = None,
+        complexity: str = "auto",
+        model_override: str | None = None,
     ):
         accounts = accounts or []
         history = history or []
@@ -375,19 +918,92 @@ class LLMManager:
                 yield event
             return
             
-        if target_agent and target_agent != "auto":
-            task_type = target_agent
-            yield 'data: ' + json.dumps({"type": "step", "step": "doorman_skipped", "message": f"Ручной выбор агента: {target_agent}. Doorman пропущен."}) + '\n\n'
-        else:
-            yield 'data: ' + json.dumps({"type": "step", "step": "init", "message": "Оценка задачи и маршрутизация (Doorman)..."}) + '\n\n'
-            intent = await self.route_intent(query)
-            task_type = intent.get("task_type", "general")
-            yield 'data: ' + json.dumps({"type": "step", "step": "doorman_ok", "message": f"Задача классифицирована: {task_type}. Подготовка контекста..."}) + '\n\n'
+        # ── Interactive Doorman Logic ──
+        if not target_agent or target_agent == "auto":
+            # Инициализируем Doorman Agent
+            from agent.roles_impl.base_agent import BaseAgent
+            import yaml
+            
+            doorman_cfg = {}
+            doorman_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "roles", "doorman.yaml")
+            if os.path.exists(doorman_path):
+                with open(doorman_path, "r", encoding="utf-8") as f:
+                    doorman_cfg = yaml.safe_load(f)
+            
+            # Модель швейцара берётся из ЕГО настроек (config/agent_configs.json), как для
+            # остальных агентов. Раньше конфиг игнорировался и resolve_model падал в цепочку
+            # routing.doorman из models.yaml — отвечала gemma4-e4b вместо выбранной модели.
+            doorman_complexity = complexity if complexity in ("light", "heavy") else "auto"
+            dm_model, _ = resolve_agent_model(self.registry, "doorman", doorman_complexity, model_override, query=query)
+            if not dm_model:
+                logger.error("❌ Doorman: нет доступной модели (проверьте настройки агента doorman)")
+                yield 'data: ' + json.dumps({
+                    "type": "error",
+                    "message": "Нет доступной модели для швейцара (doorman). Проверьте его настройки в разделе агентов.",
+                }) + '\n\n'
+                return
 
+            logger.info(f"  🚪 Швейцар (doorman) → модель {dm_model.name} ({dm_model.provider_type}), complexity={doorman_complexity}")
+            yield 'data: ' + json.dumps({"type": "step", "step": "model_selected", "message": f"Швейцар: модель {dm_model.name} ({dm_model.provider_type})"}) + '\n\n'
 
-        model = self.registry.resolve_model(task_type)
+            dm_tools = [{"name": "delegate_task", "description": "Delegate to specialized agent", "input_schema": {"type": "object", "properties": {"target_agent": {"type": "string"}, "complexity": {"type": "string"}, "structured_prompt": {"type": "string"}}, "required": ["target_agent", "complexity", "structured_prompt"]}}] # Mock schema, liteLLM will format it
+
+            if dm_model.provider_type == "anthropic":
+                dm_tools = [{"name": "delegate_task", "description": "Delegate to specialized agent", "input_schema": {"type": "object", "properties": {"target_agent": {"type": "string"}, "complexity": {"type": "string"}, "structured_prompt": {"type": "string"}}, "required": ["target_agent", "complexity", "structured_prompt"]}}]
+            else:
+                dm_tools = [{"type": "function", "function": {"name": "delegate_task", "description": "Delegate to specialized agent", "parameters": {"type": "object", "properties": {"target_agent": {"type": "string"}, "complexity": {"type": "string"}, "structured_prompt": {"type": "string"}}, "required": ["target_agent", "complexity", "structured_prompt"]}}}]
+
+            yield 'data: ' + json.dumps({"type": "step", "step": "init", "message": "Встреча (Doorman)..."}) + '\n\n'
+            
+            doorman = BaseAgent(self, doorman_cfg, dm_model, dm_tools)
+            dm_started_at = time.perf_counter()
+            
+            delegation_data = None
+            async for event in doorman.run_stream(query, history):
+                if '"type": "delegation"' in event:
+                    # Перехватываем делегирование!
+                    ev_data = json.loads(event.replace('data: ', '').strip())
+                    delegation_data = ev_data
+                    break
+                yield event
+
+            # Телеметрия: ответы швейцара тоже должны попадать в ExecutionTrace,
+            # иначе такие диалоги выпадают из аналитики целиком.
+            self._record_trace(
+                None, None, "doorman_chat", "doorman_chat",
+                dm_model, dm_tools, 0, [], dm_started_at,
+                "delegated" if delegation_data else "success",
+                session_id=task_id, task_id=task_id,
+            )
+                
+            if delegation_data:
+                # Doorman собрал ТЗ и делегирует!
+                target_agent = delegation_data.get("agent", "coder")
+                # complexity от швейцара — это explicit-выбор и он приоритетнее ROLE_DEFAULTS.
+                # Пустое значение означает "auto": решение отдаём резолверу (ROLE_DEFAULTS → эвристика),
+                # иначе отсутствие поля молча эскалировало любую задачу в heavy.
+                complexity = delegation_data.get("complexity") or "auto"
+                query = delegation_data.get("prompt", query)
+                yield 'data: ' + json.dumps({"type": "step", "step": "doorman_delegated", "message": f"Doorman передаёт задачу: {target_agent} ({complexity})"}) + '\n\n'
+                
+                # Очищаем историю, чтобы новый агент начал с чистого ТЗ (опционально)
+                history = []
+            else:
+                # Doorman просто ответил в чат (уточнил вопрос) и не делегировал. Завершаем стрим!
+                return
+                
+        task_type = target_agent
+
+        # Модели и MCP-серверы из настроек агента (config/agent_configs.json)
+        allowed_servers = ["workspace", "fs-tools", "coder", "contextus-rag", "analyst-mcp"] # Default base servers
+        model, conf = resolve_agent_model(self.registry, task_type, complexity, model_override, query=query)
+        extra_mcps = conf.get("extra_mcps")
+        if isinstance(extra_mcps, list):
+            allowed_servers.extend([s for s in extra_mcps if isinstance(s, str) and s.strip()])
+
         if not model:
-            yield 'data: ' + json.dumps({"type": "error", "message": f"Ошибка: нет доступной модели для задачи '{task_type}'."}) + '\n\n'
+            logger.error(f"❌ Нет доступной модели для задачи '{task_type}' (complexity={complexity})")
+            yield 'data: ' + json.dumps({"type": "error", "message": f"Ошибка: нет доступной модели для задачи '{task_type}' (complexity={complexity})."}) + '\n\n'
             return
 
         yield 'data: ' + json.dumps({"type": "step", "step": "model_selected", "message": f"Выбрана модель: {model.name} ({model.provider_type})"}) + '\n\n'
@@ -400,8 +1016,6 @@ class LLMManager:
         github_source_ids = []
         
         if source_ids:
-            from database import SessionLocal
-            from models import Source
             db = SessionLocal()
             try:
                 sources = db.query(Source).filter(Source.id.in_(source_ids)).all()
@@ -440,13 +1054,27 @@ class LLMManager:
         tools = None
         allowed_tool_names = None
 
+        # Gate 2.0: привилегированные инструменты получают только роли из whitelist
+        # (coder → request_plan_review / request_command_execution / request_diff_apply).
+        gate_tools = allowed_privileged_tools(task_type)
+
         if has_tools:
-            all_tools = self.mcp.get_tools_for_anthropic() if model.provider_type == "anthropic" else self.mcp.get_tools_for_llm()
+            allowed_servers = self._resolve_allowed_servers(allowed_servers, model)
+            all_tools = self.mcp.get_tools_for_anthropic(allowed_servers, allow_privileged=gate_tools) if model.provider_type == "anthropic" else self.mcp.get_tools_for_llm(allowed_servers, allow_privileged=gate_tools)
+
+            # Двойная фильтрация PRIVILEGED_TOOLS: первый фильтр — в MCPManager (по whitelist роли),
+            # второй — здесь, чтобы роль не могла выдать LLM инструмент вне своего whitelist
+            tool_name_of = (lambda t: t["name"]) if model.provider_type == "anthropic" else (lambda t: t["function"]["name"])
+            all_tools = [t for t in all_tools if tool_name_of(t) not in PRIVILEGED_TOOLS or tool_name_of(t) in gate_tools]
+
             if role_cfg and "tools" in role_cfg:
-                allowed_tool_names = set(role_cfg["tools"])
-                tools = [t for t in all_tools if (t["name"] if model.provider_type == "anthropic" else t["function"]["name"]) in allowed_tool_names]
+                allowed_tool_names = set(role_cfg["tools"]) - (PRIVILEGED_TOOLS - gate_tools)
+                tools = [t for t in all_tools if tool_name_of(t) in allowed_tool_names]
             else:
                 tools = all_tools
+
+            # Фаза B: intent-тулы фильтруются по intent_access/can_create_intent роли
+            tools = self._filter_intent_tools(tools, model, task_type)
 
         if role_cfg and "system_instruction" in role_cfg:
             system_prompt = role_cfg["system_instruction"]
@@ -454,7 +1082,24 @@ class LLMManager:
             system_prompt = "Ты — автономный ИИ-агент Contextus. Отвечай на языке пользователя.\n"
             if has_tools:
                 tool_names_list = [t["name"] if model.provider_type == "anthropic" else t["function"]["name"] for t in (tools or []) if (t["name"] if model.provider_type == "anthropic" else t["function"]["name"]) != "get_raw_html"]
-                system_prompt += f"ДОСТУПНЫЕ ИНСТРУМЕНТЫ: {', '.join(tool_names_list)}\n"
+                system_prompt += f"ДОСТУПНЫЕ ИНСТРУМЕНТЫ: {', '.join(tool_names_list)}\nВАЖНО: Если задача требует поиска актуальных данных, цен, сайтов, файлов или действий в окружении — ОБЯЗАТЕЛЬНО используй доступные инструменты (например web_search, goto_url). ЗАПРЕЩЕНО выдумывать факты или отвечать из головы, если требуются реальные данные.\n"
+
+        # Gate 2.0: инструменты request_* требуют coder_task_id — иначе агент физически
+        # не может их вызвать и начинает выдумывать идентификатор. Отдаём его явно.
+        if gate_tools and task_id:
+            system_prompt += (
+                "\n\n=== GATE 2.0 ===\n"
+                f"Твой coder_task_id: {task_id}\n"
+                "В каждом вызове request_plan_review / request_command_execution / request_diff_apply "
+                f"ВСЕГДА передавай coder_task_id=\"{task_id}\".\n"
+                "Инструменты блокируют тебя до решения Gate — это нормально, дождись ответа в результате вызова.\n"
+                "Порядок работы с файлами: request_diff_apply → одобрение → backend создаёт git-worktree "
+                "и возвращает sandbox_id → правки делаешь ТОЛЬКО через "
+                f"write_file(..., sandbox_id=\"{task_id}\") и run_terminal_command(..., sandbox_id=\"{task_id}\").\n"
+                "Без sandbox_id эти два инструмента отклоняются. Рабочий проект не меняется: "
+                "патч применяет человек шагом «Apply».\n"
+                "================\n"
+            )
         messages = []
         
         if model.provider_type == "anthropic" and system_context_blocks:
@@ -499,6 +1144,9 @@ class LLMManager:
                         with open(role_file, "r", encoding="utf-8") as f:
                             r_cfg = yaml.safe_load(f)
                             r_desc = r_cfg.get("description", "")
+                            r_tools = r_cfg.get("tools", [])
+                            if r_tools:
+                                r_desc += f" (Доступные инструменты: {', '.join(r_tools)})"
                             available_roles.append(f"- {role_name}: {r_desc}")
                     except:
                         pass
@@ -513,8 +1161,9 @@ class LLMManager:
                     f"ДОСТУПНЫЕ РОЛИ:\n{roles_text}\n\n"
                     "Каждый элемент массива должен содержать:\n"
                     " - 'topic': краткое название шага (строка)\n"
-                    " - 'prompt_instruction': подробная инструкция для выбранной роли, включающая нужный контекст\n"
-                    " - 'target_role': ID выбранной роли (из списка выше)\n\n"
+                    " - 'prompt_instruction': подробная инструкция для выбранной роли, включающая нужный контекст и указание какие инструменты вызывать\n"
+                    " - 'target_role': ТОЧНЫЙ ID роли из списка выше (например 'web_researcher' для поиска в интернете/браузере, 'coder' для работы с кодом, 'news_extractor' для новостей)\n\n"
+                    "ВАЖНО: Для задач поиска в интернете, цен, товаров или сайтов обязательно указывай target_role: 'web_researcher'.\n"
                     "Верни ТОЛЬКО валидный JSON-массив, без markdown блоков."
                 )
             })
@@ -561,7 +1210,6 @@ class LLMManager:
             db.close()
             
             all_results = []
-            PRIVILEGED_TOOLS = {"run_terminal_command", "write_file", "run_claude_coder"}
             
             for st in subtasks:
                 target_role = getattr(st, "target_role", "general") or "general"
@@ -581,30 +1229,73 @@ class LLMManager:
                         logger.error(f"Ошибка загрузки роли {target_role}: {e}")
                         target_role = "general"
 
-                # Выбор модели
-                st_model = self.registry.resolve_model(target_role)
+                # Выбор модели — через общий резолвер, как и на остальных путях:
+                # режим решает resolve_agent_mode (explicit → ROLE_DEFAULTS → эвристика),
+                # модель/серверы берутся из настроек роли. Раньше здесь стоял
+                # registry.resolve_model(target_role): настройки роли из agent_configs.json
+                # игнорировались целиком, а роль оставалась без своих extra_mcps.
+                step_query = f"{st.topic}\n{st.prompt_instruction}"
+                st_model, st_conf, st_servers, st_mode, st_reason = self._resolve_role_target(
+                    target_role, step_query, base_servers=allowed_servers
+                )
                 if not st_model:
+                    logger.warning(
+                        f"  ⚠️ [{target_role}] по настройкам шага доступной модели нет — беру модель родителя {model.name}"
+                    )
                     st_model = model
+                    st_servers = list(allowed_servers)
+                    st_mode, st_reason = "?", "fallback на модель родителя"
+
+                # Если роли нужны инструменты, но модель их не поддерживает — выбираем модель с поддержкой tools
+                if (role_cfg and role_cfg.get("tools")) or target_role in ["web_researcher", "coder", "news_extractor"]:
+                    if not st_model.supports_tools:
+                        st_model = self.registry.resolve_model("research") or self.registry.resolve_model("coding") or model
+                        st_servers = self._resolve_allowed_servers(st_servers, st_model)
+                        logger.warning(
+                            f"  ⚠️ [{target_role}] модель режима {st_mode} без поддержки tools — переключился на {st_model.name}"
+                        )
 
                 st_has_tools = st_model.supports_tools and self.mcp.is_started
                 st_tools = None
+                # Gate 2.0: whitelist привилегированных инструментов для роли подзадачи
+                st_gate_tools = allowed_privileged_tools(target_role)
                 
                 if st_has_tools:
-                    all_tools = self.mcp.get_tools_for_anthropic() if st_model.provider_type == "anthropic" else self.mcp.get_tools_for_llm()
+                    # Модель подзадачи могла смениться — пересобираем доступные серверы под неё
+                    st_allowed_servers = self._resolve_allowed_servers(st_servers, st_model)
+                    all_tools = self.mcp.get_tools_for_anthropic(st_allowed_servers, allow_privileged=st_gate_tools) if st_model.provider_type == "anthropic" else self.mcp.get_tools_for_llm(st_allowed_servers, allow_privileged=st_gate_tools)
                     if role_cfg and "tools" in role_cfg:
                         allowed_tool_names = set(role_cfg["tools"])
-                        # Принудительная двойная фильтрация PRIVILEGED_TOOLS
-                        allowed_tool_names = allowed_tool_names - PRIVILEGED_TOOLS
+                        # Принудительная двойная фильтрация PRIVILEGED_TOOLS (кроме whitelist роли)
+                        allowed_tool_names = allowed_tool_names - (PRIVILEGED_TOOLS - st_gate_tools)
                         st_tools = [t for t in all_tools if (t["name"] if st_model.provider_type == "anthropic" else t["function"]["name"]) in allowed_tool_names]
                     else:
                         # Если инструменты не заданы явно (например, general), всё равно фильтруем опасные
-                        st_tools = [t for t in all_tools if (t["name"] if st_model.provider_type == "anthropic" else t["function"]["name"]) not in PRIVILEGED_TOOLS]
+                        st_tools = [t for t in all_tools if (t["name"] if st_model.provider_type == "anthropic" else t["function"]["name"]) not in PRIVILEGED_TOOLS or (t["name"] if st_model.provider_type == "anthropic" else t["function"]["name"]) in st_gate_tools]
+                    # Фаза B: intent-тулы по правам роли подзадачи
+                    st_tools = self._filter_intent_tools(st_tools or [], st_model, target_role)
 
                 st_sys_prompt = role_cfg.get("system_instruction", "Ты — автономный ИИ-агент Contextus. Отвечай на языке пользователя.\n") if role_cfg else "Ты — автономный ИИ-агент Contextus. Отвечай на языке пользователя.\n"
                 
                 if st_has_tools:
                     tool_names_list = [t["name"] if st_model.provider_type == "anthropic" else t["function"]["name"] for t in (st_tools or []) if (t["name"] if st_model.provider_type == "anthropic" else t["function"]["name"]) != "get_raw_html"]
-                    st_sys_prompt += f"\nДОСТУПНЫЕ ИНСТРУМЕНТЫ: {', '.join(tool_names_list)}\n"
+                    st_sys_prompt += f"\nДОСТУПНЫЕ ИНСТРУМЕНТЫ: {', '.join(tool_names_list)}\nВАЖНО: Если шаг требует поиска актуальных данных, цен, сайтов, файлов или действий в окружении — ОБЯЗАТЕЛЬНО вызывай подходящие инструменты (например web_search, goto_url). ЗАПРЕЩЕНО выдумывать факты или отвечать из головы без вызова инструментов.\n"
+
+                # Инжект source_ids — модель ДОЛЖНА знать их для вызова search_knowledge_base
+                if source_ids:
+                    st_sys_prompt += f"\n=== ПОДКЛЮЧЁННЫЕ ИСТОЧНИКИ ЗНАНИЙ ===\nПри вызове search_knowledge_base ВСЕГДА передавай source_ids={json.dumps(source_ids)}.\nНЕ вызывай index_local_source — источники уже проиндексированы.\n======================================\n"
+
+                # Gate 2.0: шаг может требовать coder_task_id для request_*-инструментов
+                if st_gate_tools and task_id:
+                    st_sys_prompt += (
+                        "\n\n=== GATE 2.0 ===\n"
+                        f"Твой coder_task_id: {task_id}\n"
+                        "В каждом вызове request_* ВСЕГДА передавай "
+                        f"coder_task_id=\"{task_id}\".\n"
+                        "Пиши файлы только в песочницу: write_file / run_terminal_command "
+                        f"с sandbox_id=\"{task_id}\" (выдаётся после одобрения request_diff_apply).\n"
+                        "================\n"
+                    )
 
                 # Инжект контекста от предыдущих шагов
                 if all_results:
@@ -617,7 +1308,7 @@ class LLMManager:
                 
                 exec_messages.append({"role": "user", "content": f"Твоя задача (роль {target_role}): {st.topic}\nИнструкция: {st.prompt_instruction}"})
 
-                yield 'data: ' + json.dumps({"type": "step", "step": f"subtask_{st.id}", "message": f"Выполняю шаг: {st.topic} (Агент: {target_role})"}) + '\n\n'
+                yield 'data: ' + json.dumps({"type": "step", "step": f"subtask_{st.id}", "message": f"Выполняю шаг: {st.topic} (Агент: {target_role}, режим: {st_mode})"}) + '\n\n'
                 
                 t_start = time.perf_counter()
                 st_result = "Успешно"
@@ -657,12 +1348,15 @@ class LLMManager:
                         tool_name = tc["name"]
                         tool_args = tc["arguments"]
 
-                        # ── Runtime allowlist: блокируем привилегированные инструменты
-                        if tool_name in PRIVILEGED_TOOLS:
+                        # ── Runtime allowlist: блокируем привилегированные инструменты вне whitelist роли
+                        if tool_name in PRIVILEGED_TOOLS and tool_name not in st_gate_tools:
+                            denial = self._write_denial(target_role, tool_name)
                             blocked_msg = f"ЗАБЛОКИРОВАНО: инструмент {tool_name} запрещён для роли {target_role}"
+                            if denial:
+                                blocked_msg += f" ({denial})"
                             logger.warning(f"⛔ Заблокирована попытка вызова {tool_name} ролью {target_role}, session={task_id}")
                             st_result += f"\nTool {tool_name} BLOCKED: {blocked_msg}"
-                            yield 'data: ' + json.dumps({"type": "step", "step": "blocked", "message": f"Заблокировано: {tool_name} — привилегированный инструмент"}) + '\n\n'
+                            yield 'data: ' + json.dumps({"type": "step", "step": "blocked", "message": f"Заблокировано: {tool_name}"}) + '\n\n'
                             exec_messages.append(self._build_tool_result_msg(st_model, tc.get("id", tool_name), tool_name, blocked_msg))
                             continue
 
@@ -694,7 +1388,7 @@ class LLMManager:
                                     corrected_mark = True
 
                         try:
-                            res = await self.mcp.call_tool(tool_name, tool_args)
+                            res = await self._call_tool(tool_name, tool_args, target_role)
                             if mode == "apprentice" and corrected_mark:
                                 corrected_note = f"[System: Оператор скорректировал твои аргументы для инструмента {tool_name}. Ниже представлен результат выполнения с учетом правок.]\n"
                                 res = corrected_note + res
@@ -750,8 +1444,7 @@ class LLMManager:
                     db_session.close()
 
                 if is_failed:
-                    yield 'data: ' + json.dumps({"type": "error", "message": f"Шаг '{st.topic}' ({target_role}) завершился с ошибкой. Выполнение графа прервано."}) + '\n\n'
-                    return
+                    yield 'data: ' + json.dumps({"type": "step", "step": "subtask_failed", "message": f"⚠️ Шаг '{st.topic}' завершился с ошибкой: {st_result[:150]}"}) + '\n\n'
 
             # Aggregator Phase
             yield 'data: ' + json.dumps({"type": "step", "step": "aggregating", "message": "Сборка финального ответа (Aggregator)..."}) + '\n\n'
@@ -781,6 +1474,9 @@ class LLMManager:
         
         final_text = "ОК"
         error_hashes = []
+        call_signatures: list[str] = []          # anti-loop: подписи вызовов (tool + args)
+        result_error_signatures: list[str] = []  # anti-loop: подписи ошибок внутри результатов
+        no_progress_stop = False
         for round_num in range(max_tool_rounds):
             yield 'data: ' + json.dumps({"type": "step", "step": "generating", "message": f"Ожидание ответа от {model.name} (генерация может занять до минуты)..."}) + '\n\n'
             resp = None
@@ -850,10 +1546,16 @@ class LLMManager:
                     continue
                 tool_args = tc.get("arguments", {})
                 t_id = tc.get("id", tool_name)
-                
-                if tool_name in PRIVILEGED_TOOLS:
-                    yield 'data: ' + json.dumps({"type": "step", "step": "blocked", "message": f"Заблокировано: {tool_name} — привилегированный инструмент"}) + '\n\n'
-                    messages.append(self._build_tool_result_msg(model, t_id, tool_name, "ОШИБКА: Этот инструмент запрещен для использования в текущем режиме."))
+
+                if tool_name in PRIVILEGED_TOOLS and tool_name not in gate_tools:
+                    denial = self._write_denial(task_type, tool_name)
+                    detail = f": {denial}" if denial else " — привилегированный инструмент"
+                    blocked_text = (
+                        f"ОШИБКА: Этот инструмент запрещен для использования в текущем режиме."
+                        + (f" Причина: {denial}" if denial else "")
+                    )
+                    yield 'data: ' + json.dumps({"type": "step", "step": "blocked", "message": f"Заблокировано: {tool_name}{detail}"}) + '\n\n'
+                    messages.append(self._build_tool_result_msg(model, t_id, tool_name, blocked_text))
                     continue
                     
                 yield 'data: ' + json.dumps({"type": "step", "step": f"tool_{tool_name}", "message": f"Вызов: {tool_name}({json.dumps(tool_args, ensure_ascii=False)})"}) + '\n\n'
@@ -886,7 +1588,7 @@ class LLMManager:
                             corrected_mark = True
 
                 try:
-                    res = await self.mcp.call_tool(tool_name, tool_args)
+                    res = await self._call_tool(tool_name, tool_args, task_type)
                     if mode == "apprentice" and corrected_mark:
                         res = f"[System: Оператор скорректировал твои аргументы для инструмента {tool_name}. Ниже представлен результат выполнения с учетом правок.]\n" + res
                     
@@ -896,6 +1598,38 @@ class LLMManager:
                     # Truncate response for UI rendering
                     res_preview = res[:200].replace('\n', ' ') + ('...' if len(res) > 200 else '')
                     yield 'data: ' + json.dumps({"type": "step", "step": f"tool_result_{tool_name}", "message": f"Результат {tool_name}: {res_preview}"}) + '\n\n'
+
+                    # ── Anti-loop по ПРОГРЕССУ (а не по исключениям) ──────────────
+                    # read_file отдаёт {"error": "File not found: ..."} как обычный успешный
+                    # результат, поэтому счётчик error_hashes такие циклы не видел.
+                    call_signatures.append(self._tool_call_signature(tool_name, tool_args))
+                    err_sig = self._tool_result_error_signature(res)
+                    if err_sig:
+                        result_error_signatures.append(err_sig)
+                    else:
+                        result_error_signatures.clear()
+
+                    limit = self._NO_PROGRESS_LIMIT
+                    repeat_call = len(call_signatures) >= limit and len(set(call_signatures[-limit:])) == 1
+                    repeat_error = len(result_error_signatures) >= limit and len(set(result_error_signatures[-limit:])) == 1
+
+                    if repeat_call or repeat_error:
+                        reason = (
+                            "агент повторяет один и тот же вызов" if repeat_call
+                            else "инструмент повторно возвращает ту же ошибку"
+                        )
+                        logger.warning(f"  🛑 Anti-loop: {reason} ({tool_name}) — остановка на раунде {round_num + 1}")
+                        messages.append(self._build_tool_result_msg(
+                            model, t_id, tool_name,
+                            res + "\n[System: ОБНАРУЖЕНО ОТСУТСТВИЕ ПРОГРЕССА. Прекрати повторять это действие.]"
+                        ))
+                        yield 'data: ' + json.dumps({"type": "step", "step": "no_progress", "message": f"Остановлено: {reason} ({tool_name})"}) + '\n\n'
+                        final_text = (
+                            f"⚠️ Остановлено на раунде {round_num + 1}: {reason} ({tool_name}). "
+                            "Прогресса нет — уточните задачу или проверьте доступность инструмента."
+                        )
+                        no_progress_stop = True
+                        break
                 except Exception as e:
                     import hashlib
                     err_str = f"Ошибка: {e}"
@@ -907,6 +1641,9 @@ class LLMManager:
                         messages.append(self._build_tool_result_msg(model, t_id, tool_name, err_str + "\n[System: ОБНАРУЖЕНО ЗАЦИКЛИВАНИЕ! Прервите текущую линию действий.]"))
                     else:
                         messages.append(self._build_tool_result_msg(model, t_id, tool_name, err_str))
+
+            if no_progress_stop:
+                break
 
         for i in range(0, len(final_text), 5):
             chunk = final_text[i:i+5]
@@ -924,12 +1661,15 @@ class LLMManager:
     ) -> str:
         """
         Полный цикл инференса с поддержкой HITL (Human-in-the-Loop) и Supervisor:
-        1. Выбирает модель из routing[task_type].
+        1. Выбирает модель через общий резолвер (настройки агента, затем routing[task_type]).
         2. Если модель поддерживает tools — прикрепляет MCP-инструменты.
         3. Обрабатывает tool_calls в цикле.
         4. Если обнаружено зацикливание или вызов request_human_help, переводит сессию в ожидание.
+        Модели берутся через общий резолвер (resolve_agent_decision → настройки агента
+        из config/agent_configs.json). Раньше здесь стоял registry.resolve_model(task_type),
+        то есть Telegram-путь шёл мимо настроек агентов и резолвера режима.
         """
-        model = self.registry.resolve_model(task_type)
+        model, conf, mode, reason = resolve_agent_decision(self.registry, task_type, "auto", query=query)
         if not model:
             return f"Ошибка: нет доступной модели для задачи '{task_type}'."
 
@@ -941,7 +1681,7 @@ class LLMManager:
         tool_verified = None
         tool_verification_details = None
 
-        logger.info(f"  🎯 Execute [{task_type}] → модель: {model.name}")
+        logger.info(f"  🎯 Execute [{task_type}] → модель: {model.name} (режим {mode}: {reason})")
 
         # Инициализация сессии (если есть chat_id, создаем/используем SessionManager)
         session = None
@@ -952,12 +1692,16 @@ class LLMManager:
 
         # Собираем инструменты (только если модель поддерживает tool calling)
         tools = None
+        # Gate 2.0: та же ролевая политика, что и в execute_stream
+        exec_gate_tools = allowed_privileged_tools(task_type)
         has_tools = model.supports_tools and self.mcp.is_started
         if has_tools:
+            all_servers = self._resolve_allowed_servers(None, model)
             if model.provider_type == "anthropic":
-                tools = self.mcp.get_tools_for_anthropic()
+                tools = self.mcp.get_tools_for_anthropic(all_servers, allow_privileged=exec_gate_tools)
             else:
-                tools = self.mcp.get_tools_for_llm()
+                tools = self.mcp.get_tools_for_llm(all_servers, allow_privileged=exec_gate_tools)
+            tools = self._filter_intent_tools(tools, model, task_type)
             logger.info(f"  🔧 Прикреплено инструментов: {len(tools)}")
             if session:
                 session.tools = tools
@@ -1020,10 +1764,12 @@ class LLMManager:
                     model = fallback
                     # Пересобираем tools для нового провайдера
                     if model.supports_tools and self.mcp.is_started:
+                        # Модель сменилась — пересобираем доступные серверы под неё
+                        fb_servers = self._resolve_allowed_servers(None, model)
                         if model.provider_type == "anthropic":
-                            tools = self.mcp.get_tools_for_anthropic()
+                            tools = self.mcp.get_tools_for_anthropic(fb_servers, allow_privileged=exec_gate_tools)
                         else:
-                            tools = self.mcp.get_tools_for_llm()
+                            tools = self.mcp.get_tools_for_llm(fb_servers, allow_privileged=exec_gate_tools)
                     else:
                         tools = None
                     response = await self._chat(model, messages, tools=tools)
@@ -1109,6 +1855,7 @@ class LLMManager:
                 tools_called_names.append(tool_name)
                 tool_args = tc["arguments"]
                 tool_id = tc.get("id", tool_name)
+
                 logger.info(f"    → {tool_name}({json.dumps(tool_args, ensure_ascii=False)[:120]})")
                 
                 # --- Supervisor: Детекция зацикливания ---
@@ -1128,7 +1875,18 @@ class LLMManager:
                         continue
                 # ----------------------------------------
 
-                result_text = await self.mcp.call_tool(tool_name, tool_args)
+                # --- Runtime allowlist: привилегированные только для роли из whitelist ---
+                if tool_name in PRIVILEGED_TOOLS and tool_name not in exec_gate_tools:
+                    denial = self._write_denial(task_type, tool_name)
+                    logger.warning(f"  ⛔ Заблокирован вызов {tool_name} ролью {task_type}")
+                    blocked_text = (
+                        "ОШИБКА: Этот инструмент запрещен для использования в текущем режиме."
+                        + (f" Причина: {denial}" if denial else "")
+                    )
+                    messages.append(self._build_tool_result_msg(model, tool_id, tool_name, blocked_text))
+                    continue
+
+                result_text = await self._call_tool(tool_name, tool_args, task_type)
                 
                 # --- HITL Request (если инструмент сам попросил) ---
                 if "__hitl_request__" in result_text and session:
@@ -1183,6 +1941,144 @@ class LLMManager:
         
         return final_answer
 
+    def _filter_intent_tools(self, tools: list[dict], model: "ModelEntry", role: str) -> list[dict]:
+        """
+        Оставляет LLM только intent-тулы, разрешённые роли (Фаза B).
+        Правило живёт в role_permissions.allowed_intent_tools — здесь только применяем,
+        а server-side enforcement остаётся вторым барьером.
+        """
+        if not tools:
+            return tools
+
+        from services.role_permissions import INTENT_TOOLS, allowed_intent_tools
+
+        allowed = allowed_intent_tools(role)
+        name_of = (lambda t: t["name"]) if model.provider_type == "anthropic" else (lambda t: t["function"]["name"])
+
+        filtered = [t for t in tools if name_of(t) not in INTENT_TOOLS or name_of(t) in allowed]
+        removed = sorted({name_of(t) for t in tools if name_of(t) in INTENT_TOOLS} - allowed)
+        if removed:
+            logger.info(f"  🧩 [{role}] intent-тулы не выданы по правам роли: {removed}")
+        return filtered
+
+    def _role_meta(self, tool_name: str, role: str) -> dict[str, str] | None:
+        """
+        Служебный _meta для intent-тулов: роль вызывающего (Фаза B).
+
+        Роль НЕ кладётся в аргументы инструмента: их генерирует LLM (и в режиме
+        apprentice их может подменить оператор), поэтому в args она была бы
+        управляема извне. _meta — protocol-level канал, модель его не видит
+        и в схеме инструмента он не отражается.
+        """
+        if not tool_name.startswith("intent_"):
+            return None
+        return {CALLER_ROLE_META_KEY: (role or "").strip()}
+
+    async def _call_tool(self, tool_name: str, tool_args: dict, role: str) -> str:
+        """
+        Единая точка вызова MCP-инструмента.
+        Для intent-тулов добавляет служебный _meta с ролью; для остальных — вызов как раньше
+        (лишний kwarg не тащим: фейки/старые серверы остаются совместимыми).
+        """
+        meta = self._role_meta(tool_name, role)
+        if meta:
+            return await self.mcp.call_tool(tool_name, tool_args, meta=meta)
+        return await self.mcp.call_tool(tool_name, tool_args)
+
+    def _write_denial(self, role: str, tool_name: str) -> str | None:
+        """
+        Причина запрета write-тула по write_scope роли (Фаза A.1).
+        None — запрета нет. При запрете пишем audit: системный лог всегда,
+        плюс журнал активного intent (если он ровно один и каталог intents уже есть).
+        """
+        from services.role_permissions import write_denial_reason
+
+        reason = write_denial_reason(role, tool_name)
+        if not reason:
+            return None
+
+        logger.warning(f"  ⛔ DENY {reason}")
+        try:
+            from services import intent as intent_service
+
+            if not intent_service.intents_root().is_dir():
+                logger.info("  ℹ️ DENY зафиксирован только в логе: intent'ов ещё не заводили")
+                return reason
+
+            active = intent_service.list_intents()
+            if len(active) == 1:
+                intent_service.append_journal(active[0]["id"], "system", f"DENY {reason}")
+            else:
+                logger.info(
+                    f"  ℹ️ DENY зафиксирован только в логе: активных intent'ов {len(active)} (нужен ровно один)"
+                )
+        except Exception as e:
+            logger.error(f"  ⚠️ Не удалось записать DENY в intent: {e}")
+        return reason
+
+    # ── Anti-loop: считаем прогресс, а не исключения ───────────────
+
+    #: сколько раз подряд допустим один и тот же вызов / одну и ту же ошибку
+    _NO_PROGRESS_LIMIT = 3
+    #: маркеры того, что успешный результат инструмента на самом деле описывает ошибку
+    _ERROR_MARKERS = (
+        "error", "ошибка", "not found", "не найден", "no such file",
+        "access denied", "traceback", "exception", "denied", "timeout", "таймаут",
+    )
+    _PATH_LIKE_RE = re.compile(r"[^\s\"']*[/\\][^\s\"']*")
+    _FILENAME_RE = re.compile(r"[\w.\-]+\.[A-Za-z0-9]{1,6}\b")
+    _PAREN_DETAIL_RE = re.compile(r"\([^)]*\)")
+    _DIGITS_RE = re.compile(r"\d+")
+
+    def _tool_call_signature(self, tool_name: str, tool_args: dict) -> str:
+        """Подпись вызова (имя + нормализованные аргументы): повтор подписи = топтание на месте."""
+        try:
+            payload = json.dumps(tool_args or {}, sort_keys=True, ensure_ascii=False, default=str)
+        except Exception:
+            payload = str(tool_args)
+        return f"{tool_name}:{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]}"
+
+    @classmethod
+    def _tool_result_error_signature(cls, result: str) -> str | None:
+        """
+        Подпись ошибки внутри УСПЕШНОГО ответа инструмента (или None, если ошибки нет).
+
+        Нужна потому, что read_file возвращает {"error": "File not found: ..."} обычным
+        результатом без исключения, и счётчик по исключениям такие циклы не замечает.
+        Пути и числа нормализуются, чтобы «File not found: a/main.py» и
+        «File not found: b/main.py» дали одну подпись.
+        """
+        text = (result or "").strip()
+        if not text:
+            return None
+
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = None
+
+        if isinstance(parsed, dict):
+            if not parsed.get("error"):
+                return None
+            body = str(parsed["error"])
+        elif isinstance(parsed, list):
+            return None
+        else:
+            body = text
+
+        lowered = body.lower()
+        if not any(marker in lowered for marker in cls._ERROR_MARKERS):
+            return None
+
+        # «File not found: backend/main.py (project root: /app/...)» и
+        # «File not found: main.py» должны дать одну подпись, иначе цикл не поймать.
+        normalized = cls._PAREN_DETAIL_RE.sub(" ", lowered)
+        normalized = cls._PATH_LIKE_RE.sub("<path>", normalized)
+        normalized = cls._FILENAME_RE.sub("<path>", normalized)
+        normalized = cls._DIGITS_RE.sub("<n>", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()[:200]
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
     # ── Meta-Analyst ───────────────────────────────────────────────
 
     def _should_trigger_analyst(self, task_type: str) -> bool:
@@ -1197,96 +2093,11 @@ class LLMManager:
 
     async def run_meta_analyst(self, session_id: str) -> str:
         """
-        Запускает Ревизора по конкретной сессии.
+        Запускает Ревизора по конкретной сессии (через отдельный класс AnalystAgent).
         """
-        import yaml
-        import time
-        from pathlib import Path
-        
-        _BACKEND_DIR = Path(__file__).resolve().parent.parent
-        
-        logger.info(f"  🔍 Запуск Meta-Analyst для сессии {session_id}...")
-        
-        try:
-            role_path = _BACKEND_DIR / "roles" / "meta_analyst.yaml"
-            with open(role_path, "r", encoding="utf-8") as f:
-                role_cfg = yaml.safe_load(f)
-        except Exception as e:
-            logger.error(f"  ❌ Ошибка загрузки meta_analyst.yaml: {e}")
-            return f"Ошибка: {e}"
-
-        # Используем "карусель" роутинга для meta_analyst, игнорируя жестко заданную модель в yaml
-        model = self.registry.resolve_model("meta_analyst")
-        if not model:
-            logger.error("  ❌ Нет доступных моделей для Meta-Analyst.")
-            return "Модель недоступна."
-            
-        logger.info(f"  🤖 Meta-Analyst использует модель: {model.name}")
-
-        # Разрешены только инструменты аналитика
-        allowed_tool_names = set(role_cfg.get("tools", []))
-        all_tools = self.mcp.get_tools_for_anthropic() if model.provider_type == "anthropic" else self.mcp.get_tools_for_llm()
-        tools = [t for t in all_tools if (t.get("name") if "name" in t else t.get("function", {}).get("name")) in allowed_tool_names]
-
-        messages = [
-            {"role": "system", "content": role_cfg.get("system_instruction", "")},
-            {"role": "user", "content": f"session_id={session_id}. Выполни шаги 1-4 из алгоритма. Начни с вызова get_global_analytics()."}
-        ]
-
-        try:
-            # ── ReAct Loop: крутимся, пока модель вызывает инструменты ──
-            MAX_ITERATIONS = 6
-            for iteration in range(MAX_ITERATIONS):
-                logger.info(f"  🔄 Meta-Analyst итерация {iteration + 1}/{MAX_ITERATIONS}")
-                response = await self._chat(model, messages, tools=tools)
-                if not response:
-                    return "Не получен ответ от модели."
-
-                tool_calls = self._extract_tool_calls(model, response)
-
-                # Если модель не вызвала инструменты — это финальный текстовый ответ
-                if not tool_calls:
-                    final_text = self._extract_text(model, response)
-                    if not final_text and iteration > 0:
-                        # Модель дала пустой ответ после инструментов — принудительно запрашиваем текст
-                        logger.warning(f"  ⚠️ Meta-Analyst: пустой финальный ответ на итерации {iteration + 1}, запрашиваем принудительно")
-                        messages.append(self._build_assistant_msg(model, response))
-                        messages.append({"role": "user", "content": "На основе данных, которые ты уже получил от инструментов, напиши подробный текстовый отчёт. Не вызывай инструменты — только текст."})
-                        forced_response = await self._chat(model, messages, tools=None)
-                        final_text = self._extract_text(model, forced_response) if forced_response else ""
-                    if final_text:
-                        log_path = _BACKEND_DIR / "improvements_log.md"
-                        with open(log_path, "a", encoding="utf-8") as f:
-                            ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                            f.write(f"\n## Meta-Analyst Analysis ({ts})\nSession: {session_id}\n{final_text}\n")
-                        return final_text
-                    return "Аналитик не сформировал отчет."
-
-                # Модель хочет вызвать инструменты — выполняем все
-                messages.append(self._build_assistant_msg(model, response))
-                for tc in tool_calls:
-                    t_name = tc["name"]
-                    t_args = tc["arguments"]
-                    t_id = tc.get("id", t_name)
-                    logger.info(f"  🔧 Meta-Analyst вызывает {t_name}({t_args})")
-                    result = await self.mcp.call_tool(t_name, t_args)
-                    messages.append(self._build_tool_result_msg(model, t_id, t_name, result))
-
-            # Если исчерпали итерации — принудительный финальный ответ
-            logger.warning("  ⚠️ Meta-Analyst: лимит итераций исчерпан, запрашиваем финальный ответ")
-            messages.append({"role": "user", "content": "Лимит вызовов инструментов исчерпан. Сформируй итоговый отчет на основе уже собранных данных."})
-            final_response = await self._chat(model, messages, tools=None)
-            final_text = self._extract_text(model, final_response) or "Аналитик не сформировал отчет."
-            log_path = _BACKEND_DIR / "improvements_log.md"
-            with open(log_path, "a", encoding="utf-8") as f:
-                ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                f.write(f"\n## Meta-Analyst Analysis ({ts})\nSession: {session_id}\n{final_text}\n")
-            return final_text
-        except Exception as e:
-            logger.error(f"  ❌ Ошибка выполнения Meta-Analyst: {e}")
-            return str(e)
-
-    # ── Внутренние методы ──────────────────────────────────────────
+        from agent.roles_impl.analyst import AnalystAgent
+        agent = AnalystAgent(self)
+        return await agent.run(session_id)
 
     def _detect_stub(self, text: str) -> bool:
         if not text:
@@ -1338,12 +2149,13 @@ class LLMManager:
                 return False, f"Verification failed: {e}"
         return None, None
 
-    def _record_trace(self, session, chat_id, task_type_classified, task_type_final, model, tools, tools_called, tools_called_names, t_start, final_status, tool_verified=None, tool_verification_details=None):
+    def _record_trace(self, session, chat_id, task_type_classified, task_type_final, model, tools, tools_called, tools_called_names, t_start, final_status, tool_verified=None, tool_verification_details=None, *, session_id: str | None = None, task_id: str | None = None):
         db = SessionLocal()
         try:
             duration = int((time.perf_counter() - t_start) * 1000)
             trace = ExecutionTrace(
-                session_id=session.session_id if session else (str(chat_id) if chat_id else str(uuid.uuid4())),
+                session_id=session_id or (session.session_id if session else (str(chat_id) if chat_id else str(uuid.uuid4()))),
+                task_id=task_id,
                 task_type_classified=task_type_classified,
                 task_type_final=task_type_final,
                 model_used=model.name if model else "none",
@@ -1597,7 +2409,13 @@ class LLMManager:
 
     def _extract_text(self, model: ModelEntry, response: dict) -> str:
         if model.provider_type == "ollama":
-            return response.get("message", {}).get("content", "")
+            msg = response.get("message", {})
+            text = msg.get("content", "")
+            if not text and "thinking" in msg:
+                text = msg.get("thinking", "")
+            if not text:
+                text = response.get("response", "")
+            return text or ""
         elif model.provider_type == "openai":
             return response.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
         elif model.provider_type == "anthropic":

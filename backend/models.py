@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Text, Table, Boolean, Float
+from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Text, Table, Boolean, Float, UniqueConstraint
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from database import Base
@@ -44,14 +44,36 @@ conversation_sources = Table(
     Column("source_id", String(36), ForeignKey("sources.id", ondelete="CASCADE"), primary_key=True)
 )
 
+class User(Base):
+    """Пользователь системы. Роль — на уровне человека, не беседы."""
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    role = Column(String(20), default="user", nullable=False)  # "user" | "admin"
+    telegram_chat_id = Column(String(50), unique=True, index=True, nullable=True)
+    display_name = Column(String(255), nullable=True)
+    linking_token = Column(String(64), nullable=True)       # одноразовый deep-link токен привязки
+    linking_token_expires = Column(DateTime, nullable=True)  # TTL токена (10 мин)
+    login_token = Column(String(64), nullable=True)         # одноразовый токен входа через Telegram
+    login_token_expires = Column(DateTime, nullable=True)    # TTL токена входа (10 мин)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    conversations = relationship("Conversation", back_populates="user")
+
 class Conversation(Base):
     __tablename__ = "conversations"
+    __table_args__ = (
+        UniqueConstraint("telegram_chat_id", name="uq_conversation_telegram_chat_id"),
+    )
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     title = Column(String(255), nullable=False, default="Новая беседа")
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # nullable на переходный период
+    telegram_chat_id = Column(String(50), index=True, nullable=True)  # для UI-иконки, НЕ источник роли
     created_at = Column(DateTime, default=datetime.utcnow)
 
     # Связи
+    user = relationship("User", back_populates="conversations")
     messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan")
     sources = relationship("Source", secondary=conversation_sources, backref="conversations")
 
@@ -169,34 +191,70 @@ class HumanCorrection(Base):
     correction_text = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-class PendingPrivilegedAction(Base):
-    __tablename__ = "pending_privileged_actions"
+class WebSession(Base):
+    """
+    Реестр веб-сессий — служебный, а НЕ источник правды о доступе.
+
+    Сессия сама по себе stateless (HMAC-токен в cookie), но из токена невозможно узнать,
+    кто залогинен и когда истечёт: значит предупредить «сессия истекает через сутки»
+    неоткуда. Одна строка на пользователя — минимально достаточное состояние для
+    этой узкой задачи (уведомление), без дублирования процесса аутентификации.
+    """
+    __tablename__ = "web_sessions"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    expires_at = Column(DateTime, nullable=False)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+    notified_at = Column(DateTime, nullable=True)  # когда предупредили о скором истечении
+
+
+class IntentSpec(Base):
+    __tablename__ = "intent_specs"
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    action_type = Column(String(50), nullable=False)   # 'prompt_update' | 'coder_task'
-    target = Column(String(255), nullable=False)        # target_persona или target_file
-    instruction = Column(Text, nullable=False)     # new_prompt или coder instruction
-    reasoning = Column(Text, nullable=False)       # диагноз от Ревизора
-    session_id = Column(String(36), nullable=True)  # из какой сессии
-    status = Column(String(50), default="awaiting_approval")
-    # awaiting_approval -> approved -> coder_running -> diff_ready
-    # -> diff_approved -> applied | rejected
-    diff_content = Column(Text, nullable=True)
+    task_id = Column(String(128), index=True, unique=True, nullable=False)
+    session_id = Column(String(36), nullable=True)
+    previous_intent_id = Column(String(36), nullable=True)
+    version = Column(Integer, default=1, nullable=False)
+    title = Column(String(255), nullable=True)
+    summary = Column(Text, nullable=True)
+    requirements_json = Column(Text, nullable=True)
+    constraints_json = Column(Text, nullable=True)
+    status = Column(String(50), default="DRAFT_SPEC")
+    content_hash = Column(String(96), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-from sqlalchemy.dialects.postgresql import JSON
+class OutboxEvent(Base):
+    __tablename__ = "outbox_events"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    event_type = Column(String(100), nullable=False)
+    payload = Column(Text, nullable=False)
+    status = Column(String(50), default="PENDING")
+    retry_count = Column(Integer, default=0)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 class ScenarioDefinition(Base):
     __tablename__ = "scenario_definitions"
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    name = Column(String)
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String(255))
     description = Column(Text)
     steps = Column(Text)  # using Text for JSON compatibility across sqlite/pg
-    scenario_hash = Column(String, index=True, nullable=True)  # sha256 of steps
-    approved_hash = Column(String, nullable=True)  # Signed approved hash
-    proposed_by_session_id = Column(String, nullable=True)
-    status = Column(String, default="draft")  # draft -> active | rejected
+    
+    intent_id = Column(String(36), ForeignKey("intent_specs.id"), nullable=True)
+    source_task_id = Column(String(128), nullable=True)
+    proposed_by_session_id = Column(String(128), nullable=True)
+    mode = Column(String(16), nullable=True)
+    
+    scenario_hash = Column(String(96), index=True, nullable=True)  # sha256 of steps
+    approved_hash = Column(String(96), nullable=True)  # Signed approved hash
+    approved_by = Column(String(128), nullable=True)
+    approved_at = Column(DateTime, nullable=True)
+    previous_scenario_id = Column(String(36), nullable=True)
+    
+    status = Column(String(50), default="draft")  # draft -> active | rejected
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class ApprenticeStep(Base):
@@ -227,8 +285,10 @@ class ActionRequest(Base):
     __tablename__ = "action_requests"
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    # Привязка к задаче кодера (AgentTask или PendingPrivilegedAction)
-    coder_task_id = Column(String(36), nullable=False, index=True)
+    # Ссылка на породившую запись: AgentTask у gate-запросов (request_* кодера).
+    # У предложений meta-analyst (prompt_update/coder_task) и у эскалации apprentice
+    # задачи кодера НЕТ — сессия давно завершена, поэтому NULL, а не фиктивная ссылка.
+    coder_task_id = Column(String(36), nullable=True, index=True)
     # Тип запрашиваемого действия
     action_type = Column(String(50), nullable=False)
     # RUN_COMMAND  — запрос на выполнение bash-команды в песочнице
@@ -241,3 +301,47 @@ class ActionRequest(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+class ModelCatalog(Base):
+    """
+    Каталог локальных моделей, обнаруженных в Ollama (GET /api/tags).
+
+    models.yaml остаётся источником курируемых записей (облако, алиасы, ручные метаданные).
+    Здесь хранится всё, что реально установлено в Ollama, — чтобы выпадающие списки в UI
+    совпадали с `ollama list`, а не только с хардкодом из YAML.
+
+    Записи не удаляются при пропаже модели из Ollama, а помечаются `installed=False`:
+    иначе сохранённые конфиги агентов (agent_configs.json) начали бы ссылаться на
+    несуществующую модель только потому, что Ollama временно недоступна.
+    """
+    __tablename__ = "model_catalog"
+
+    id = Column(String, primary_key=True)              # ключ реестра = tag модели в Ollama
+    provider_name = Column(String, nullable=False, default="ollama")
+    provider_type = Column(String, nullable=False, default="ollama")
+    model_id = Column(String, nullable=False, index=True)
+    context_window = Column(Integer, default=4096)
+    supports_tools = Column(Boolean, default=False)
+    supports_vision = Column(Boolean, default=False)
+    tags = Column(String, default="")                  # CSV: local, discovered, ...
+    installed = Column(Boolean, default=True, index=True)
+    enabled = Column(Boolean, default=True)            # можно скрыть модель из UI, не удаляя
+    size_bytes = Column(Integer, default=0)
+    digest = Column(String, nullable=True)
+    capabilities_raw = Column(Text, nullable=True)     # JSON из /api/show (для отладки)
+    first_seen_at = Column(DateTime, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AuditLog(Base):
+    """Аудит-лог привилегированных действий."""
+    __tablename__ = "audit_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    source = Column(String(20), nullable=False)     # "telegram" | "web_ui"
+    action = Column(String(100), nullable=False)     # "approve_action", "reject_action", "edit_role", ...
+    target_id = Column(String(128), nullable=True)   # ID объекта, над которым действие
+    detail = Column(Text, nullable=True)             # JSON: diff, args, reason
+    result = Column(String(20), nullable=False)      # "success" | "denied"
+    created_at = Column(DateTime, default=datetime.utcnow)

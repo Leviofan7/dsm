@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState } from "react"
 import {
   ChevronDown, Brain, CheckCircle2, XCircle, Globe,
   Camera, Zap, Loader2, ShieldAlert, ImageIcon,
@@ -12,6 +12,8 @@ export interface AgentThinkingStep {
   type: "step" | "error" | "done"
   message: string
   timestamp: number
+  /** Тип события от бэкенда (init, model_selected, generating, thought…) */
+  step_type?: string
   /** Base64 screenshot attached to block/error events */
   screenshot?: string
 }
@@ -64,12 +66,10 @@ function ScreenshotPreview({ base64 }: { base64: string }) {
 }
 
 export function AgentThinkingBubble({ steps, isWorking }: AgentThinkingBubbleProps) {
-  const [expanded, setExpanded] = useState(isWorking)
-
-  useEffect(() => {
-    setExpanded(isWorking)
-  }, [isWorking])
-
+  // По умолчанию свёрнут: в шапке и так виден текущий шаг, а развёрнутый лог на десятки
+  // строк вытеснял из вьюпорта предыдущие сообщения — казалось, что вопрос «пропал».
+  // Пользователь может развернуть лог кликом.
+  const [expanded, setExpanded] = useState(false)
 
   const lastStep = steps[steps.length - 1]
   const hasError = steps.some(s => s.type === "error")

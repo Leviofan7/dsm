@@ -17,6 +17,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("contextus.worker")
 
+# Воркер тоже зовёт Telegram (эскалация от 14B-надсмотрщика), а httpx печатает URL целиком —
+# вместе с токеном бота в пути. Держим только предупреждения и ошибки.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # Глобальный LLMManager для воркера
 worker_llm_manager = LLMManager()
 
@@ -32,7 +37,7 @@ async def shutdown(ctx):
     if 'llm_manager' in ctx:
         await ctx['llm_manager'].shutdown()
 
-async def run_agent_task(ctx, task_id: str, query: str, chat_id: int, history: list, accounts: list, source_ids: list, attached_folders: list, target_agent: str = "auto", mode: str = "auto"):
+async def run_agent_task(ctx, task_id: str, query: str, chat_id: int, history: list, accounts: list, source_ids: list, attached_folders: list, target_agent: str = "auto", mode: str = "auto", complexity: str = "auto"):
     """Главная задача ARQ: запуск агента и обработка его цикла."""
     logger.info(f"Начало выполнения задачи {task_id} для chat_id={chat_id}")
     llm_manager: LLMManager = ctx['llm_manager']
@@ -74,7 +79,8 @@ async def run_agent_task(ctx, task_id: str, query: str, chat_id: int, history: l
             source_ids=source_ids,
             attached_folders=attached_folders,
             target_agent=target_agent,
-            mode=mode
+            mode=mode,
+            complexity=complexity
         ):
             db = SessionLocal()
             try:
@@ -176,6 +182,54 @@ async def cancel_stuck_hitl_tasks(ctx):
     finally:
         db.close()
 
+
+async def cleanup_stale_sandboxes(ctx):
+    """
+    ТЗ 4.7: удаляет устаревшие git-worktree песочницы кодера.
+
+    Не трогает песочницы, чьи задачи ещё живы (ActionRequest в ожидании решения Gate),
+    и те, что моложе TTL. TTL настраивается через SANDBOX_TTL_HOURS (по умолчанию 24).
+    """
+    try:
+        ttl_hours = float(os.getenv("SANDBOX_TTL_HOURS", "24"))
+    except ValueError:
+        ttl_hours = 24.0
+
+    from services import sandbox as sandbox_service
+
+    active_task_ids: set[str] = set()
+    db = SessionLocal()
+    try:
+        rows = db.query(ActionRequest).filter(
+            ActionRequest.status.in_(("pending_supervisor", "pending_friend_call", "approved"))
+        ).all()
+        active_task_ids = {r.coder_task_id for r in rows if r.coder_task_id}
+    except Exception as e:
+        logger.error(f"Sandbox cleanup: не удалось получить активные задачи ({e}) — пропускаю удаление")
+        db.close()
+        return
+    finally:
+        db.close()
+
+    removed: list[str] = []
+    kept: list[str] = []
+    for entry in sandbox_service.list_sandboxes():
+        task_id = entry["task_id"]
+        age = entry["age_hours"]
+        if task_id in active_task_ids:
+            kept.append(f"{task_id}(active)")
+            continue
+        if age < ttl_hours:
+            kept.append(f"{task_id}({age:.1f}h)")
+            continue
+        sandbox_service.remove_sandbox(task_id)
+        removed.append(task_id)
+
+    logger.info(
+        f"🧹 Sandbox cleanup: удалено {len(removed)} {removed or ''}, "
+        f"оставлено {len(kept)} {kept or ''} (TTL={ttl_hours}h)"
+    )
+
 # ARQ конфигурация
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
@@ -259,7 +313,10 @@ async def run_supervisor_review(ctx, action_request_id: str):
 
 class WorkerSettings:
     functions = [run_agent_task, run_supervisor_review]
-    cron_jobs = [cron(cancel_stuck_hitl_tasks, minute=set(range(0, 60, 5)))]
+    cron_jobs = [
+        cron(cancel_stuck_hitl_tasks, minute=set(range(0, 60, 5))),
+        cron(cleanup_stale_sandboxes, minute=set(range(0, 60, 30))),
+    ]
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = RedisSettings.from_dsn(redis_url)

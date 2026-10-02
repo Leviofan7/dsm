@@ -18,12 +18,14 @@ import os
 import sys
 import json
 import socket
+import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 CDP_PORT = 9222
+FORWARD_PORT = 9223
 DAEMON_PORT = 9224
 
 
@@ -32,6 +34,58 @@ def is_port_open(port: int, host: str = "127.0.0.1") -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(1)
         return s.connect_ex((host, port)) == 0
+
+
+def ensure_forwarder() -> bool:
+    """
+    Гарантирует TCP-forwarder 9223 → 9222, неважно, кто поднял Chrome.
+
+    Дыра, найденная 26.09: если Chrome уже слушал CDP, демон отвечал «already_running» и
+    форвардер НЕ поднимал. Итог — «Chrome есть, CDP недоступен»: контейнер честно получал
+    connection refused, обе попытки подключения проваливались, и агент молча уходил в
+    headless-фолбэк без GUI.
+    """
+    if is_port_open(FORWARD_PORT):
+        return True
+
+    script = SCRIPT_DIR / "tcp_forward.py"
+    if not script.exists():
+        print(f"[❌ Launcher] Нет {script} — форвардер не поднять")
+        return False
+
+    try:
+        print(f"[🔧 Launcher] Поднимаю TCP-forwarder {FORWARD_PORT} → {CDP_PORT}...")
+        ChromeLauncherHandler._forwarder_process = subprocess.Popen(
+            [sys.executable, str(script)],
+            cwd=str(SCRIPT_DIR),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"[❌ Launcher] Не удалось запустить forwarder: {e}")
+        return False
+
+    for _ in range(10):
+        time.sleep(0.2)
+        if is_port_open(FORWARD_PORT):
+            print(f"[✅ Launcher] TCP-forwarder готов на {FORWARD_PORT}")
+            return True
+    return False
+
+
+def forwarder_watchdog() -> None:
+    """
+    Сторож: Chrome могли поднять вручную (run_real_chrome.sh), а форвардер — прибить или не
+    поднять. Раз в 10 секунд выравниваем состояние: CDP слушает, форвардера нет → поднимаем.
+    """
+    while True:
+        time.sleep(10)
+        try:
+            if is_port_open(CDP_PORT) and not is_port_open(FORWARD_PORT):
+                print("[🛡️ Launcher] Chrome есть, а TCP-forwarder пропал — восстанавливаю...")
+                ensure_forwarder()
+        except Exception as e:
+            print(f"[⚠️ Launcher] watchdog: {e}")
 
 
 class ChromeLauncherHandler(BaseHTTPRequestHandler):
@@ -49,10 +103,14 @@ class ChromeLauncherHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def _handle_launch(self):
-        """Запускает Chrome, если ещё не запущен."""
-        # Если Chrome уже слушает CDP — ничего не делаем
+        """Запускает Chrome, если ещё не запущен, и ГАРАНТИРУЕТ TCP-forwarder."""
+        # Форвардер нужен контейнеру независимо от того, кто поднял Chrome: без него
+        # «Chrome есть, CDP refused» — и агент молча падает в headless (инцидент 26.09).
+        forwarder_ok = ensure_forwarder()
+
+        # Если Chrome уже слушает CDP — ничего не запускаем, но форвардер уже выровнен
         if is_port_open(CDP_PORT):
-            self._respond(200, {"status": "already_running", "cdp_port": CDP_PORT})
+            self._respond(200, {"status": "already_running", "cdp_port": CDP_PORT, "forwarder": forwarder_ok})
             return
 
         # Запускаем run_real_chrome.sh
@@ -75,7 +133,7 @@ class ChromeLauncherHandler(BaseHTTPRequestHandler):
                 time.sleep(0.5)
                 if is_port_open(CDP_PORT):
                     print(f"[✅ Launcher] Chrome готов на порту {CDP_PORT}")
-                    self._respond(200, {"status": "launched", "cdp_port": CDP_PORT})
+                    self._respond(200, {"status": "launched", "cdp_port": CDP_PORT, "forwarder": forwarder_ok})
                     return
 
             print(f"[⚠️ Launcher] Chrome не запустился за 10 секунд")
@@ -114,6 +172,8 @@ def main():
 
     server = HTTPServer(("0.0.0.0", DAEMON_PORT), ChromeLauncherHandler)
     print(f"[🔧 Launcher] Chrome Launcher Daemon слушает на порту {DAEMON_PORT}")
+    # Сторож форвардера: Chrome могли поднять вручную, а форвардер прибить/не дождаться
+    threading.Thread(target=forwarder_watchdog, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

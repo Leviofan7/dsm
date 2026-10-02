@@ -1,0 +1,131 @@
+{
+  "coder": {
+    "light": {
+      "models": [
+        "qwen-coder",
+        "deepseek-chat"
+      ],
+      "extra_mcps": [
+        "fs-tools",
+        "coder-gate-tools",
+        "deepseek-harness"
+      ]
+    },
+    "heavy": {
+      "models": [
+        "deepseek-chat"
+      ],
+      "extra_mcps": [
+        "gemini-cli-mcp",
+        "coder-gate-tools",
+        "deepseek-harness"
+      ]
+    }
+  },
+  "code_architect": {
+    "light": {
+      "models": [
+        "gemma4-26b",
+        "deepseek-chat"
+      ],
+      "extra_mcps": []
+    },
+    "heavy": {
+      "models": [
+        "deepseek-chat"
+      ],
+      "extra_mcps": []
+    }
+  },
+  "web_researcher": {
+    "light": {
+      "models": [
+        "gemma4-26b",
+        "deepseek-chat"
+      ],
+      "extra_mcps": [
+        "web-stealth"
+      ]
+    },
+    "heavy": {
+      "models": [
+        "deepseek-chat"
+      ],
+      "extra_mcps": [
+        "gemini-cli-mcp",
+        "web-stealth"
+      ]
+    }
+  },
+  "supervisor_14b": {
+    "light": {
+      "models": [
+        "supervisor-14b",
+        "deepseek-chat"
+      ],
+      "extra_mcps": [
+        "coder-gate-tools"
+      ]
+    },
+    "heavy": {
+      "models": [
+        "deepseek-chat"
+      ],
+      "extra_mcps": [
+        "coder-gate-tools"
+      ]
+    }
+  },
+  "meta_analyst": {
+    "light": {
+      "models": [
+        "gemma4-26b",
+        "deepseek-chat"
+      ],
+      "extra_mcps": []
+    },
+    "heavy": {
+      "models": [
+        "claude-sonnet",
+        "deepseek-chat"
+      ],
+      "extra_mcps": []
+    }
+  },
+  "news_extractor": {
+    "light": {
+      "models": [
+        "gemma4-26b",
+        "deepseek-chat"
+      ],
+      "extra_mcps": [
+        "web-stealth"
+      ]
+    },
+    "heavy": {
+      "models": [
+        "deepseek-chat"
+      ],
+      "extra_mcps": [
+        "web-stealth"
+      ]
+    }
+  },
+  "doorman": {
+    "light": {
+      "models": [
+        "deepseek-chat",
+        "deepseek-r1:8b"
+      ],
+      "extra_mcps": []
+    },
+    "heavy": {
+      "models": [
+        "deepseek-chat"
+      ],
+      "extra_mcps": [
+        "deepseek-harness"
+      ]
+    }
+  }
+}

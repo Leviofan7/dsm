@@ -4,7 +4,7 @@ const WORKER_SECRET = "default_secret"
 
 export async function POST(req: NextRequest) {
   try {
-    const { messages, agentAllowed, accounts, debugMode, sourceIds, targetAgent, mode, chatId } = await req.json()
+    const { messages, agentAllowed, accounts, debugMode, sourceIds, targetAgent, mode, complexity, chatId } = await req.json()
     const lastMessage = messages[messages.length - 1]
     
     // We pass all previous messages as history so the agent remembers context
@@ -31,6 +31,7 @@ export async function POST(req: NextRequest) {
         source_ids: sourceIds || [],
         target_agent: targetAgent || "auto",
         mode: mode || "auto",
+        complexity: complexity || "auto",
         chat_id: chatId || "",
       }),
     })

@@ -54,7 +54,8 @@ export default function RootLayout({
       className={`dark bg-background ${geistSans.variable} ${geistMono.variable}`}
     >
       <body className="font-sans antialiased" suppressHydrationWarning>
-        <TooltipProvider delayDuration={200}>{children}</TooltipProvider>
+        {/* Base UI: задержка тултипов — проп `delay` (а не radix-овский delayDuration) */}
+        <TooltipProvider delay={200}>{children}</TooltipProvider>
         {process.env.NODE_ENV === 'production' && <Analytics />}
       </body>
     </html>

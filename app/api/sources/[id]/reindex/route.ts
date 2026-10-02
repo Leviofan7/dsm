@@ -1,24 +1,18 @@
-import { NextResponse } from "next/server"
-
-const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8000"
+import { NextRequest, NextResponse } from "next/server"
+import { backendUrl, relayBackendResponse, sessionHeaders } from "@/lib/backend-proxy"
 
 export async function POST(
-  _req: Request,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const { id } = await params
-    const res = await fetch(`${BACKEND_URL}/sources/${id}/reindex`, {
+    const res = await fetch(`${backendUrl()}/sources/${id}/reindex`, {
       method: "POST",
+      headers: sessionHeaders(req),
     })
-
-    const data = await res.json()
-    if (!res.ok) {
-      return NextResponse.json(data, { status: res.status })
-    }
-    return NextResponse.json(data)
-  } catch (error) {
-    console.error("Failed to reindex source:", error)
-    return NextResponse.json({ error: "Failed to reindex source" }, { status: 500 })
+    return await relayBackendResponse(res)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }

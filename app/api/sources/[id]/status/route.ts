@@ -1,23 +1,18 @@
-import { NextResponse } from "next/server"
-
-const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8000"
+import { NextRequest, NextResponse } from "next/server"
+import { backendUrl, relayBackendResponse, sessionHeaders } from "@/lib/backend-proxy"
 
 export async function GET(
-  _req: Request,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const { id } = await params
-    const res = await fetch(`${BACKEND_URL}/sources/${id}/status`, {
+    const res = await fetch(`${backendUrl()}/sources/${id}/status`, {
+      headers: sessionHeaders(req),
       cache: "no-store",
     })
-
-    if (!res.ok) {
-      return NextResponse.json({ error: "Not found" }, { status: res.status })
-    }
-    return NextResponse.json(await res.json())
-  } catch (error) {
-    console.error("Failed to get source status:", error)
-    return NextResponse.json({ error: "Failed to get status" }, { status: 500 })
+    return await relayBackendResponse(res)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }

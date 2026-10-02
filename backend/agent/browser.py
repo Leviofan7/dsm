@@ -1,10 +1,22 @@
+"""
+Браузерное ядро web-stealth (исполняется ВНУТРИ MCP-сервера — см. mcp_servers/web_stealth.py).
+
+ВАЖНО: у MCP-сервера stdout — протокольный канал JSON-RPC. Любой print() в stdout ломает
+клиенту парсинг сообщений (в логах бэкенда — «Failed to parse JSONRPC message» с трейсбеком
+на каждую строку, включая многострочные тексты исключений Playwright). Поэтому весь вывод —
+только в stderr через `file=sys.stderr`. Инвариант стережёт tests/test_mcp_stdout_hygiene.py.
+"""
+
 import asyncio
 import json
 import os
+import sys
 import base64
 import math
 import random
 from pathlib import Path
+
+import httpx
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from playwright_stealth import Stealth
 
@@ -55,12 +67,12 @@ class BrowserSession:
 
         # ── Попытка 1: подключиться к уже запущенному Chrome по CDP ──
         try:
-            print(f"[🌐 Browser] Подключаюсь к Chrome по CDP ({cdp_url})...")
+            print(f"[🌐 Browser] Подключаюсь к Chrome по CDP ({cdp_url})...", file=sys.stderr)
             self.browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
             connected_via_cdp = True
-            print(f"[✅ Browser] Подключён к Chrome по CDP — GUI-режим активен!")
+            print(f"[✅ Browser] Подключён к Chrome по CDP — GUI-режим активен!", file=sys.stderr)
         except Exception as e:
-            print(f"[⚠️ Browser] CDP на {cdp_url} недоступен: {e}")
+            print(f"[⚠️ Browser] CDP на {cdp_url} недоступен: {e}", file=sys.stderr)
 
         # ── Попытка 2: запуск Chrome на хосте через Launcher Daemon ──
         if not connected_via_cdp:
@@ -69,12 +81,12 @@ class BrowserSession:
             launcher_url = f"http://{launcher_host}:{launcher_port}/launch"
             
             try:
-                print(f"[🚀 Browser] Отправляю запрос на запуск Chrome → {launcher_url}")
+                print(f"[🚀 Browser] Отправляю запрос на запуск Chrome → {launcher_url}", file=sys.stderr)
                 async with httpx.AsyncClient(timeout=15.0) as client:
                     resp = await client.get(launcher_url)
                     if resp.status_code == 200:
                         data = resp.json()
-                        print(f"[🚀 Browser] Launcher ответил: {data.get('status', 'ok')}")
+                        print(f"[🚀 Browser] Launcher ответил: {data.get('status', 'ok')}", file=sys.stderr)
                         
                         # Даём Chrome секунду на стабилизацию после запуска
                         await asyncio.sleep(1.0)
@@ -83,22 +95,23 @@ class BrowserSession:
                         try:
                             self.browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
                             connected_via_cdp = True
-                            print(f"[✅ Browser] Chrome запущен демоном и подключён по CDP — GUI-режим!")
+                            print(f"[✅ Browser] Chrome запущен демоном и подключён по CDP — GUI-режим!", file=sys.stderr)
                         except Exception as e_cdp:
-                            print(f"[⚠️ Browser] Chrome запущен, но CDP недоступен: {e_cdp}")
+                            print(f"[⚠️ Browser] Chrome запущен, но CDP недоступен: {e_cdp}", file=sys.stderr)
                     else:
-                        print(f"[⚠️ Browser] Launcher вернул {resp.status_code}: {resp.text}")
+                        print(f"[⚠️ Browser] Launcher вернул {resp.status_code}: {resp.text}", file=sys.stderr)
             except Exception as e_launcher:
-                print(f"[⚠️ Browser] Launcher Daemon недоступен ({launcher_url}): {e_launcher}")
+                # Тип исключения в сообщении — не роскошь: без него NameError выглядел как «daemon down»
+                print(f"[⚠️ Browser] Launcher Daemon недоступен ({launcher_url}): {type(e_launcher).__name__}: {e_launcher}", file=sys.stderr)
 
         # ── Попытка 3: локальный headless Chromium (гарантированный fallback) ──
         if not connected_via_cdp:
-            print(f"[⚠️ Browser] CDP недоступен. Запускаю встроенный headless Chromium...")
+            print(f"[⚠️ Browser] CDP недоступен. Запускаю встроенный headless Chromium...", file=sys.stderr)
             try:
                 self.browser = await self.playwright.chromium.launch(headless=True, args=launch_args)
-                print(f"[✅ Browser] Headless Chromium запущен (без GUI-окна)")
+                print(f"[✅ Browser] Headless Chromium запущен (без GUI-окна)", file=sys.stderr)
             except Exception as e_launch:
-                print(f"[❌ Browser] Не удалось запустить Chromium: {e_launch}")
+                print(f"[❌ Browser] Не удалось запустить Chromium: {e_launch}", file=sys.stderr)
                 raise e_launch
             
         # Берем дефолтный контекст
@@ -113,9 +126,9 @@ class BrowserSession:
             domain = urllib.parse.urlparse(target_url).netloc
             found = await self.connect_to_tab(domain)
             if found:
-                print(f"[✅ Browser] Найдена открытая вкладка с {domain}")
+                print(f"[✅ Browser] Найдена открытая вкладка с {domain}", file=sys.stderr)
             else:
-                print(f"[✅ Browser] Открыта новая вкладка для {domain}")
+                print(f"[✅ Browser] Открыта новая вкладка для {domain}", file=sys.stderr)
         else:
             if not self.page:
                 if self.context.pages and self.context.pages[0].url == "about:blank":
@@ -133,14 +146,14 @@ class BrowserSession:
                 
         # Дополнительно накатываем stealth, чтобы подчистить мелкие JS-переменные
         await Stealth().apply_stealth_async(self.page)
-        print("[✅ Browser] Успешно подключено. Браузер готов к работе.")
+        print("[✅ Browser] Успешно подключено. Браузер готов к работе.", file=sys.stderr)
 
     async def close(self):
         # ВАЖНО: При работе по CDP метод self.browser.close() закрывать НЕ НАДО, 
         # иначе мы убьем сам системный процесс Chrome. Просто отключаемся.
         if self.playwright:
             await self.playwright.stop()
-            print("[🌐 Browser] Сессия отладки Playwright завершена.")
+            print("[🌐 Browser] Сессия отладки Playwright завершена.", file=sys.stderr)
 
     async def connect_to_tab(self, target_domain: str) -> bool:
         """Ищет открытую вкладку по домену и делает ее активной, исключая дубликаты"""
@@ -290,9 +303,9 @@ class BrowserSession:
                 
                 # 3. КРИТИЧНО: Даем время на плавную анимацию прокрутки и подгрузку контента (Lazy Load)
                 await asyncio.sleep(1.2)
-                print(f"[⚙️ Browser] Выполнен физический скролл {direction} на {scroll_step}px")
+                print(f"[⚙️ Browser] Выполнен физический скролл {direction} на {scroll_step}px", file=sys.stderr)
             except Exception as e:
-                print(f"[⚠️ Browser] Ошибка физического скролла: {e}. Пробую плавный фолбек...")
+                print(f"[⚠️ Browser] Ошибка физического скролла: {e}. Пробую плавный фолбэк...", file=sys.stderr)
                 # Резервный вариант, если мышь заблокирована
                 delta = "window.innerHeight * 0.6" if direction == "down" else "-window.innerHeight * 0.6"
                 await self.page.evaluate(f"window.scrollBy({{ top: {delta}, behavior: 'smooth' }})")
@@ -512,7 +525,7 @@ class BrowserSession:
                     await self._stealth_move_mouse(target_x, target_y)
                     await asyncio.sleep(random.uniform(0.3, 0.8))
         except Exception as e:
-            print(f"[⚠️ Browser] hover_neutral_element error: {e}")
+            print(f"[⚠️ Browser] hover_neutral_element error: {e}", file=sys.stderr)
 
     async def simulate_text_selection(self):
         if not self.page: return
@@ -540,7 +553,7 @@ class BrowserSession:
                     await asyncio.sleep(random.uniform(0.5, 1.2))
                     await self.page.evaluate("window.getSelection().removeAllRanges()")
         except Exception as e:
-            print(f"[⚠️ Browser] simulate_text_selection error: {e}")
+            print(f"[⚠️ Browser] simulate_text_selection error: {e}", file=sys.stderr)
 
     # ── Resilience methods ────────────────────────────────────────
 

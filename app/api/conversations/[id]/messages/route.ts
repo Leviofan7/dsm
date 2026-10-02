@@ -1,40 +1,37 @@
-import { NextResponse } from "next/server"
-
-const BACKEND_URL = "http://localhost:8000"
+import { NextRequest, NextResponse } from "next/server"
+import { backendUrl, relayBackendResponse, sessionHeaders } from "@/lib/backend-proxy"
 
 export async function GET(
-  req: Request,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const { id } = await params
-    const res = await fetch(`${BACKEND_URL}/conversations/${id}/messages`, {
+    const res = await fetch(`${backendUrl()}/conversations/${id}/messages`, {
+      method: "GET",
+      headers: sessionHeaders(req),
       cache: "no-store",
     })
-    if (!res.ok) throw new Error(`Backend: ${res.status}`)
-    return NextResponse.json(await res.json())
-  } catch (error) {
-    console.error("Failed to fetch messages:", error)
-    return NextResponse.json({ error: "Failed to fetch messages" }, { status: 500 })
+    return await relayBackendResponse(res)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }
 
 export async function POST(
-  req: Request,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const { id } = await params
     const body = await req.json()
-    const res = await fetch(`${BACKEND_URL}/conversations/${id}/messages`, {
+    const res = await fetch(`${backendUrl()}/conversations/${id}/messages`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: sessionHeaders(req, { json: true }),
       body: JSON.stringify(body),
     })
-    if (!res.ok) throw new Error(`Backend: ${res.status}`)
-    return NextResponse.json(await res.json())
-  } catch (error) {
-    console.error("Failed to add message:", error)
-    return NextResponse.json({ error: "Failed to add message" }, { status: 500 })
+    return await relayBackendResponse(res)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }

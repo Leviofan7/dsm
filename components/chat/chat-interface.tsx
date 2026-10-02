@@ -25,8 +25,8 @@ import { FileTree } from "@/components/chat/file-tree"
 import { MessageBubble } from "@/components/chat/message-bubble"
 import { AgentToggle, type AgentAccount } from "@/components/chat/agent-toggle"
 import { AgentSelector } from "@/components/chat/agent-selector"
+import { ComplexityToggle } from "@/components/chat/complexity-toggle"
 import { ApprenticeCard, type ApprenticeStep } from "@/components/chat/apprentice-card"
-import { ActionRequestCard, type ActionRequestData } from "@/components/chat/action-request-card"
 import { AgentThinkingBubble, type AgentThinkingStep } from "@/components/chat/agent-thinking-bubble"
 import { ConversationList } from "@/components/chat/conversation-list"
 import { SourceSelector } from "@/components/chat/source-selector"
@@ -37,6 +37,9 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog"
+
+/** Ключ localStorage: активный чат должен переживать перезагрузку страницы и HMR. */
+const ACTIVE_CONV_STORAGE_KEY = "contextus_active_conversation"
 
 export function ChatInterface() {
   // --- Conversations ---
@@ -79,12 +82,48 @@ export function ChatInterface() {
   const [isAnalyzing, setIsAnalyzing] = useState(false)
   const [targetAgent, setTargetAgent] = useState("auto")
   const [mode, setMode] = useState("auto")
+  const [complexity, setComplexity] = useState<"light" | "heavy" | "auto">("auto")
   const [pendingApprenticeStep, setPendingApprenticeStep] = useState<ApprenticeStep | null>(null)
-  // Apprentice-Gate 2.0: active action requests from the autonomous coder
-  const [pendingActionRequests, setPendingActionRequests] = useState<ActionRequestData[]>([])
+
+  useEffect(() => {
+    const saved = localStorage.getItem("chatComplexity")
+    if (saved === "light" || saved === "heavy" || saved === "auto") {
+      setComplexity(saved)
+    }
+  }, [])
+
+  const handleComplexityChange = (val: "light" | "heavy" | "auto") => {
+    setComplexity(val)
+    localStorage.setItem("chatComplexity", val)
+  }
+
+  // Активный чат переживает перезагрузку страницы и HMR: без этого любой ремоунт
+  // компонента оставлял пустой чат, и казалось, что отправленный вопрос «пропал».
+  useEffect(() => {
+    const saved = localStorage.getItem(ACTIVE_CONV_STORAGE_KEY)
+    if (saved) setActiveConvId(saved)
+  }, [])
+
+  useEffect(() => {
+    if (activeConvId) localStorage.setItem(ACTIVE_CONV_STORAGE_KEY, activeConvId)
+    else localStorage.removeItem(ACTIVE_CONV_STORAGE_KEY)
+  }, [activeConvId])
+
+  // Примечание: карточки ActionRequest (Gate 2.0) в веб-UI намеренно НЕ реализованы.
+  // Подтверждения этой очереди идут через Telegram (кнопки в сообщении), см. решение
+  // в памяти проекта. Раньше здесь была карточка, но события `action_request` бэкенд
+  // не эмитил, а сам компонент упал бы на рассинхроне action_type (RUN_COMMAND vs
+  // request_command_execution), — удалён вместе с legacy /improvements.
 
   const abortControllerRef = useRef<AbortController | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const streamingTimestampRef = useRef<number>(Date.now())
+  // Прилипание автоскролла: пока пользователь внизу — ведём вьюпорт, если он
+  // ушёл читать историю — не выдёргиваем его на каждый шаг агента.
+  const atBottomRef = useRef(true)
+  // Сохранилось ли сообщение пользователя в БД: если POST не прошёл, ресинк с сервером
+  // затёр бы сообщение из UI, которого там ещё нет
+  const userPersistedRef = useRef(true)
 
   const activeConv = conversations.find((c) => c.id === activeConvId) ?? null
   const selectedCount = selected.size
@@ -112,6 +151,12 @@ export function ChatInterface() {
   async function fetchMessages(convId: string) {
     try {
       const res = await fetch(`/api/conversations/${convId}/messages`)
+      if (res.status === 404) {
+        // Чат удалён (например, id восстановили из localStorage) — сбрасываем выбор
+        setActiveConvId((prev) => (prev === convId ? null : prev))
+        setMessages([])
+        return
+      }
       if (res.ok) {
         const data = await res.json()
         setMessages(data.map((m: any) => ({
@@ -119,6 +164,9 @@ export function ChatInterface() {
           role: m.role,
           content: m.content,
           timestamp: m.timestamp,
+          // steps агента тоже persisted в БД: раньше они отбрасывались при загрузке,
+          // и «мысли» исчезали после перезагрузки или ресинка
+          steps: Array.isArray(m.steps) && m.steps.length > 0 ? m.steps : undefined,
         })))
       }
     } catch (e) {
@@ -240,6 +288,7 @@ export function ChatInterface() {
   // Load messages when active conversation changes
   useEffect(() => {
     if (activeConvId) {
+      atBottomRef.current = true
       fetchMessages(activeConvId)
     } else {
       setMessages([])
@@ -256,12 +305,18 @@ export function ChatInterface() {
     }
   }, [activeConv?.sourceIds?.join(","), allSources.length])
 
-  // Auto-scroll
+  // Auto-scroll (только пока пользователь у нижней границы списка)
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" })
-    }
+    const el = scrollRef.current
+    if (!el || !atBottomRef.current) return
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" })
   }, [messages, streamingContent, isAgentWorking])
+
+  const handleScroll = () => {
+    const el = scrollRef.current
+    if (!el) return
+    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+  }
 
   const handleAccountsChange = (newAccounts: AgentAccount[]) => {
     setAccounts(newAccounts)
@@ -401,9 +456,11 @@ export function ChatInterface() {
     const updatedMessages = [...messages, userMsg]
     setMessages(updatedMessages)
     setInput("")
+    atBottomRef.current = true  // своё сообщение всегда показываем внизу
 
     let dbMsgId = userMsg.id
     // Persist to DB
+    userPersistedRef.current = false
     try {
       const dbRes = await fetch(`/api/conversations/${activeConvId}/messages`, {
         method: "POST",
@@ -413,6 +470,7 @@ export function ChatInterface() {
       if (dbRes.ok) {
         const dbData = await dbRes.json()
         dbMsgId = dbData.id
+        userPersistedRef.current = true
         setMessages((prev) => prev.map(m => m.id === userMsg.id ? { ...m, id: dbMsgId } : m))
         updatedMessages[updatedMessages.length - 1].id = dbMsgId
       }
@@ -432,6 +490,7 @@ export function ChatInterface() {
     setIsAgentWorking(false)
     setStreamingContent("")
     setAgentSteps([])
+    streamingTimestampRef.current = Date.now()
 
     try {
       const res = await fetch("/api/chat", {
@@ -446,6 +505,7 @@ export function ChatInterface() {
           sourceIds: activeConv?.sourceIds || [],
           targetAgent: targetAgent,
           mode: mode,
+          complexity: complexity,
           chatId: activeConvId,
         }),
       })
@@ -485,6 +545,7 @@ export function ChatInterface() {
         const decoder = new TextDecoder()
         let buffer = ""
         let currentContent = ""
+        let streamFailed = false
 
         while (true) {
           const { done, value } = await reader.read()
@@ -511,7 +572,7 @@ export function ChatInterface() {
                     timestamp: Date.now(),
                     screenshot: parsed.screenshot || undefined,
                   }])
-                  reader.cancel()
+                  streamFailed = true
                   break
                 } else if (currentEvent === "step" || parsed.step || parsed.type === "step") {
                   setAgentSteps(prev => [...prev, {
@@ -554,17 +615,6 @@ export function ChatInterface() {
                       }
                     }
                   } catch { }
-                } else if (parsed.type === "action_request") {
-                  // Apprentice-Gate 2.0: кодер запрашивает разрешение
-                  const reqData: ActionRequestData = {
-                    id: parsed.id,
-                    coder_task_id: parsed.coder_task_id,
-                    action_type: parsed.action_type,
-                    payload: parsed.payload || {},
-                    supervisor_notes: parsed.supervisor_notes,
-                    created_at: parsed.created_at || new Date().toISOString(),
-                  }
-                  setPendingActionRequests(prev => [...prev, reqData])
                 } else if (currentEvent === "result" || parsed.type === "result" || (parsed.content && !parsed.type)) {
                   currentContent += parsed.content
                   setStreamingContent(currentContent)
@@ -575,6 +625,8 @@ export function ChatInterface() {
               }
             }
           }
+
+          if (streamFailed) break
         }
 
         setIsAgentWorking(false)
@@ -600,6 +652,9 @@ export function ChatInterface() {
             if (dbRes.ok) {
               const dbData = await dbRes.json()
               setMessages((prev) => prev.map(m => (m.content === contentToSave && m.role === "assistant") ? { ...m, id: dbData.id, steps: finalSteps } : m))
+              // Сервер теперь знает и вопрос, и ответ со шагами — приводим чат к его
+              // состоянию, чтобы никакие гонки/ремоунты не оставили «половину» диалога
+              if (userPersistedRef.current) await fetchMessages(activeConvId)
             }
           } catch { }
         }
@@ -762,7 +817,7 @@ export function ChatInterface() {
           </div>
         ) : (
           <>
-            <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-6 md:px-8">
+            <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-5 py-6 md:px-8">
               <div className="mx-auto flex max-w-3xl flex-col gap-6">
                 {messages.map((m) => (
                   <div key={m.id} className="flex flex-col gap-2">
@@ -789,29 +844,9 @@ export function ChatInterface() {
                   />
                 )}
 
-                {/* Apprentice-Gate 2.0: action request cards */}
-                {pendingActionRequests.map((req) => (
-                  <ActionRequestCard
-                    key={req.id}
-                    request={req}
-                    onApprove={async (id) => {
-                      await fetch(`/api/action-requests/${id}/approve`, { method: "POST" })
-                      setPendingActionRequests(prev => prev.filter(r => r.id !== id))
-                    }}
-                    onReject={async (id, reason) => {
-                      await fetch(`/api/action-requests/${id}/reject`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ reason }),
-                      })
-                      setPendingActionRequests(prev => prev.filter(r => r.id !== id))
-                    }}
-                  />
-                ))}
-
                 {streamingContent && (
                   <MessageBubble
-                    message={{ id: "streaming", role: "assistant", content: streamingContent, timestamp: Date.now() }}
+                    message={{ id: "streaming", role: "assistant", content: streamingContent, timestamp: streamingTimestampRef.current }}
                   />
                 )}
               </div>
@@ -838,6 +873,10 @@ export function ChatInterface() {
                     onChange={setTargetAgent} 
                     mode={mode} 
                     onModeChange={setMode} 
+                  />
+                  <ComplexityToggle
+                    value={complexity}
+                    onChange={handleComplexityChange}
                   />
                   <AgentToggle
                     enabled={agentAllowed}

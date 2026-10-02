@@ -17,6 +17,7 @@ export interface Conversation {
   title: string
   createdAt: string
   sourceIds: string[]
+  telegram_chat_id?: string | null
 }
 
 export const connectedSources: ConnectedSource[] = [

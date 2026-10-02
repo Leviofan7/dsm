@@ -28,6 +28,14 @@ from pydantic import Field
 from database import SessionLocal
 from models import ActionRequest
 from api.action_requests import get_event
+from services.sandbox import (
+    auto_checkpoint_enabled,
+    baseline_warning,
+    create_stash_checkpoint,
+    materialize_files,
+    registered_sandbox_dir,
+    sandbox_dir,
+)
 
 logger = logging.getLogger("contextus.coder_gate")
 
@@ -39,7 +47,7 @@ mcp = FastMCP(
 _POLL_INTERVAL = 2.0    # секунды между проверками статуса
 _GATE_TIMEOUT = 3600.0  # максимум ожидания (1 час)
 
-# Директория песочницы — передаётся через env при запуске
+# Директория песочницы — берётся из services.sandbox (env CODER_SANDBOX_DIR)
 _SANDBOX_DIR = os.getenv("CODER_SANDBOX_DIR", "/tmp/coder_sandbox")
 
 
@@ -137,13 +145,24 @@ async def request_command_execution(
             "error": f"Команда отклонена Gate. Причина: {decision.get('feedback', 'нет комментария')}",
         })
 
-    # Выполняем команду в директории песочницы
-    sandbox = Path(_SANDBOX_DIR)
+    # Выполняем команду ТОЛЬКО внутри песочницы задачи (git-worktree)
+    sandbox = registered_sandbox_dir(coder_task_id)
+    if not sandbox:
+        return json.dumps({
+            "success": False,
+            "stdout": "",
+            "stderr": "",
+            "returncode": -1,
+            "error": (
+                "Песочница для задачи не создана: сначала согласуй изменения через "
+                "request_diff_apply (после одобрения backend создаёт git-worktree)."
+            ),
+        })
     try:
         result = subprocess.run(
             command,
             shell=True,
-            cwd=str(sandbox) if sandbox.is_dir() else "/tmp",
+            cwd=str(sandbox),
             capture_output=True,
             text=True,
             timeout=120,
@@ -153,6 +172,7 @@ async def request_command_execution(
             "stdout": result.stdout[-4000:],    # обрезаем для LLM
             "stderr": result.stderr[-2000:],
             "returncode": result.returncode,
+            "cwd": str(sandbox),
             "error": None,
         })
     except subprocess.TimeoutExpired:
@@ -195,9 +215,16 @@ async def request_diff_apply(
     coder_task_id: str = Field(..., description="ID текущей задачи кодера"),
 ) -> str:
     """
-    Запрашивает применение написанного кода к проекту.
+    Запрашивает разрешение на изменение файлов проекта.
     Всегда эскалируется к человеку через шлюз «Звонок другу».
-    Кодер блокируется до решения.
+    Кодер блокируется до решения Во время ожидания.
+
+    После одобрения backend:
+      1) (опционально) делает git-stash checkpoint, если auto_checkpoint=true;
+      2) создаёт git-worktree задачи (/tmp/coder_sandbox/<coder_task_id>);
+      3) переносит предложенные файлы в песочницу;
+      4) возвращает sandbox_id — его надо передавать в write_file / run_terminal_command.
+    В рабочий проект ничего не пишется: применение патча — отдельный шаг «Apply» человеком.
     """
     request_id = _create_action_request(
         coder_task_id=coder_task_id,
@@ -208,11 +235,52 @@ async def request_diff_apply(
     logger.info(f"📂 Кодер ждёт разрешения на запись файлов (request_id={request_id})")
     decision = await _wait_for_decision(request_id)
 
+    if decision["status"] != "approved":
+        return json.dumps({
+            "approved": False,
+            "feedback": decision.get("feedback", ""),
+            "message": "Запись отклонена. Комментарий: " + (decision.get("feedback") or "нет комментария"),
+        })
+
+    # Одобрено: разворачиваем песочницу и переносим туда файлы
+    checkpoint, cp_err = create_stash_checkpoint(coder_task_id)
+    if cp_err:
+        logger.warning(f"Checkpoint не создан: {cp_err}")
+
+    written, provision_err = materialize_files(coder_task_id, files_diff)
+    sandbox = sandbox_dir(coder_task_id)
+
+    # Baseline песочницы — HEAD: незакоммиченные правки проекта в неё не попадают.
+    # Сообщаем об этом отдельным полем, авто-stash не делаем.
+    wip_warning = baseline_warning()
+    if wip_warning:
+        logger.warning(f"WIP-warning для {coder_task_id}: {wip_warning[:120]}")
+
+    if provision_err:
+        return json.dumps({
+            "approved": True,
+            "sandbox_id": coder_task_id if sandbox.exists() else None,
+            "files_written": written,
+            "warning": wip_warning,
+            "error": provision_err,
+            "message": ("Изменения одобрены, но песочницу развернуть не удалось. "
+                        "Исправь files_diff (JSON {путь: содержимое} или unified diff) и вызови инструмент снова."),
+        })
+
     return json.dumps({
-        "approved": decision["status"] == "approved",
-        "feedback": decision.get("feedback", ""),
-        "message": "Изменения одобрены. Можно записывать файлы." if decision["status"] == "approved"
-                   else f"Запись отклонена. Комментарий: {decision.get('feedback', 'нет комментария')}",
+        "approved": True,
+        "sandbox_id": coder_task_id,
+        "sandbox_dir": str(sandbox),
+        "files_written": written,
+        "checkpoint": checkpoint,
+        "checkpoint_enabled": auto_checkpoint_enabled(),
+        "warning": wip_warning,
+        "message": (
+            "Изменения одобрены и перенесены в песочницу проекта. "
+            f"Дальше правь файлы через write_file(..., sandbox_id=\"{coder_task_id}\") "
+            f"и запускай проверки через run_terminal_command(..., sandbox_id=\"{coder_task_id}\"). "
+            "В рабочий проект изменения попадут только после шага «Apply» у человека."
+        ),
     })
 
 

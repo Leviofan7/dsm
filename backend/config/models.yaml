@@ -179,11 +179,25 @@ routing:
       - qwen-coder           # Фолбек 1
       - deepseek-chat        # Фолбек 2
 
-  general:
-    description: "Общие вопросы без специальных требований"
+  web_researcher:
+    description: "Веб-исследователь: поиск в интернете, переход по сайтам, сбор цен и контактов"
     chain:
-      - gemma4-e4b           # Быстрая для простых вопросов
-      - gemma4-26b           # Фолбек 1: тяжёлая локальная
+      - gemma4-26b           # Приоритет: локальная с tools + vision
+      - qwen-coder           # Фолбек 1: qwen3.6 с tools
+      - deepseek-chat        # Фолбек 2
+
+  news_extractor:
+    description: "Парсинг и анализ новостей"
+    chain:
+      - gemma4-26b
+      - qwen-coder
+      - deepseek-chat
+
+  general:
+    description: "Общие вопросы"
+    chain:
+      - gemma4-26b           # Приоритет: локальная с поддержкой tools
+      - gemma4-e4b           # Фолбек: быстрая
       - gemini-flash         # Фолбек 2
       - deepseek-chat        # Фолбек 3
 

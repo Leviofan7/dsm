@@ -17,12 +17,15 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from database import SessionLocal, get_db
 from models import ActionRequest
+from auth import require_admin
+from services import human_queue
+import audit
 
 logger = logging.getLogger("contextus.action_requests")
 
@@ -57,11 +60,14 @@ class RejectBody(BaseModel):
 router = APIRouter(prefix="/api/action-requests", tags=["action-requests"])
 
 
-@router.get("/pending")
+@router.get("/pending", dependencies=[Depends(require_admin)])
 def list_pending(db: Session = Depends(get_db)):
     """
     Возвращает список ActionRequest'ов в статусе pending_friend_call.
     Используется Web UI для отображения карточек ожидания.
+
+    Только для админа: payload содержит то, что кот пытается сделать — команды и диффы,
+    то есть содержимое, которое само по себе чувствительно.
     """
     requests = (
         db.query(ActionRequest)
@@ -83,7 +89,12 @@ def list_pending(db: Session = Depends(get_db)):
 
 
 @router.post("/{request_id}/approve")
-def approve(request_id: str, db: Session = Depends(get_db)):
+def approve(
+    request_id: str,
+    db: Session = Depends(get_db),
+    current_user = Depends(require_admin),
+    background_tasks: BackgroundTasks = None,
+):
     """
     Одобряет ActionRequest.
     Меняет статус на 'approved' и разблокирует asyncio.Event,
@@ -99,13 +110,25 @@ def approve(request_id: str, db: Session = Depends(get_db)):
     req.updated_at = datetime.utcnow()
     db.commit()
 
-    resolve_event(request_id)
-    logger.info(f"✅ ActionRequest {request_id} approved by human")
-    return {"status": "approved"}
+    # Развилка по типу: gate-записи только будят ожидающий инструмент, а предложения
+    # meta-analyst / эскалации apprentice надо ИСПОЛНИТЬ — иначе approve молча меняет
+    # статус и ничего не делает (см. services/human_queue.py).
+    outcome = human_queue.dispatch_approval(req, current_user.id)
+
+    if outcome.get("dispatched") and outcome.get("status") == "coder_running":
+        background_tasks.add_task(human_queue.run_coder_task, req.id)
+    elif outcome.get("status") == "unblocked":
+        resolve_event(request_id)
+
+    logger.info(f"✅ ActionRequest {request_id} approved by human → {outcome}")
+    # status — состояние записи, outcome — что именно произошло при approve
+    # (unblocked / applied / coder_running / step_accepted). Не смешиваем.
+    return {"status": req.status, "outcome": outcome.get("status"), "dispatched": outcome.get("dispatched"),
+            "step_id": outcome.get("step_id"), "error": outcome.get("error")}
 
 
 @router.post("/{request_id}/reject")
-def reject(request_id: str, body: RejectBody, db: Session = Depends(get_db)):
+def reject(request_id: str, body: RejectBody, db: Session = Depends(get_db), current_user = Depends(require_admin)):
     """
     Отклоняет ActionRequest с необязательным комментарием.
     Меняет статус на 'rejected' и разблокирует asyncio.Event,
@@ -122,9 +145,45 @@ def reject(request_id: str, body: RejectBody, db: Session = Depends(get_db)):
     req.updated_at = datetime.utcnow()
     db.commit()
 
+    audit.log_action(db, current_user.id, "web_ui", "reject_action", request_id, body.reason, "success")
+
+    # Отказ тоже должен доехать до ждущего: у apprentice это поле human_decision в БД,
+    # иначе фоновый агент будет вечно ждать решения по отклонённому запросу.
+    human_queue.reject_side_effects(req, current_user.id, body.reason)
+
     resolve_event(request_id)
     logger.info(f"❌ ActionRequest {request_id} rejected by human. Reason: {body.reason}")
     return {"status": "rejected"}
+
+
+@router.post("/{request_id}/apply-diff")
+def apply_diff(request_id: str, db: Session = Depends(get_db), current_user = Depends(require_admin)):
+    """
+    Шаг «Применить» для готового диффа (только для coder_task-предложений).
+
+    Отдельный шаг сохранён сознательно (наследие legacy /privileged-actions): approve лишь
+    запускает кодера в песочнице, а перенос изменений в рабочий проект — второе осознанное
+    действие человека. Коммит не делается (см. sandbox.apply_patch_to_project).
+    """
+    req = db.query(ActionRequest).filter(ActionRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="ActionRequest not found")
+    if req.status != "diff_ready":
+        raise HTTPException(status_code=409, detail=f"Cannot apply: status is '{req.status}'")
+
+    ok, err = human_queue.apply_patch(req)
+    if not ok:
+        req.status = "apply_failed"
+        db.commit()
+        audit.log_action(db, current_user.id, "web_ui", "apply_diff", request_id, f"Git apply failed: {err}", "denied")
+        raise HTTPException(status_code=422, detail=f"Git apply failed: {err}")
+
+    req.status = "applied"
+    req.updated_at = datetime.utcnow()
+    db.commit()
+    audit.log_action(db, current_user.id, "web_ui", "apply_diff", request_id, "Патч применён к проекту", "success")
+    logger.warning(f"📦 Патч по запросу {request_id} применён к рабочему проекту")
+    return {"status": "applied"}
 
 
 # ─── MCP-инструменты для Надсмотрщика (импортируются в analyst_mcp.py) ────────

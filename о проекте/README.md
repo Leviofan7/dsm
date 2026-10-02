@@ -5,6 +5,10 @@
 First, run the development server:
 
 ```bash
+cd /home/ai-line/Projects/dsm
+bash run_real_chrome.sh
+
+docker compose logs -f docker contextus_worker
 
 cd /home/ai-line/Projects/dsm
 npm run dev

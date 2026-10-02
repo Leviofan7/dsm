@@ -1,26 +1,17 @@
-import { NextResponse } from "next/server"
+import { NextRequest, NextResponse } from "next/server"
+import { backendUrl, relayBackendResponse, sessionHeaders } from "@/lib/backend-proxy"
 
-const BACKEND_URL = "http://localhost:8000"
-
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
-    
-    const res = await fetch(`${BACKEND_URL}/sources/local`, {
+
+    const res = await fetch(`${backendUrl()}/sources/local`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: sessionHeaders(req, { json: true }),
       body: JSON.stringify(body),
     })
-    
-    if (!res.ok) {
-      const errorData = await res.json().catch(() => ({}))
-      throw new Error(errorData.detail || `Backend responded with status: ${res.status}`)
-    }
-    
-    const data = await res.json()
-    return NextResponse.json(data)
-  } catch (error) {
-    console.error("Failed to add local source:", error)
-    return NextResponse.json({ error: error instanceof Error ? error.message : "Failed to add source" }, { status: 500 })
+    return await relayBackendResponse(res)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }

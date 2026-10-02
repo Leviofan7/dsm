@@ -1,7 +1,8 @@
 import os
 import yaml
 import sys
-from mcp.server.fastmcp import FastMCP, Message
+from mcp.server.fastmcp import FastMCP
+from mcp.types import PromptMessage, TextContent
 
 # Path to the roles directory
 ROLES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "roles")
@@ -21,18 +22,18 @@ def load_role(role_name: str) -> dict:
 # or we can just read the directory and create a generic 'get_role' prompt.
 
 @mcp.prompt("get_role")
-def get_role(role_name: str) -> list[Message]:
+def get_role(role_name: str) -> list[PromptMessage]:
     """Retrieve the system instructions for a specific role."""
     role_data = load_role(role_name)
     if not role_data:
-        return [Message.user(f"Role '{role_name}' not found.")]
+        return [PromptMessage(role="user", content=TextContent(type="text", text=f"Role '{role_name}' not found."))]
         
     instruction = role_data.get("system_instruction", "")
     description = role_data.get("description", "")
     
     prompt_content = f"Role: {role_name}\nDescription: {description}\n\nSystem Instruction:\n{instruction}"
     
-    return [Message.user(prompt_content)]
+    return [PromptMessage(role="user", content=TextContent(type="text", text=prompt_content))]
 
 @mcp.tool()
 async def list_available_roles() -> str:

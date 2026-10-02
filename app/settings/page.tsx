@@ -73,22 +73,6 @@ export default function SettingsPage() {
             </CardContent>
           </Card>
 
-          <Card className="border-border">
-            <CardHeader>
-              <CardTitle className="text-base">Embedding model</CardTitle>
-              <CardDescription>
-                Vectors are generated with the model below.
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="flex items-center justify-between rounded-lg border border-border bg-muted/40 px-3 py-2.5">
-                <span className="font-mono text-sm">text-embedding-3-large</span>
-                <span className="rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
-                  Active
-                </span>
-              </div>
-            </CardContent>
-          </Card>
         </div>
       </div>
     </AppShell>

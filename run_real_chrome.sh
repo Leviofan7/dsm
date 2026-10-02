@@ -7,6 +7,18 @@ CDP_PORT=9222
 CHROME_BIN="google-chrome-stable"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ── TCP-forwarder 9223 → 9222 ─────────────────────────────
+# Нужен контейнеру для CDP и не зависит от того, кто поднял Chrome. Раньше скрипт уходил
+# в exit при уже запущенном Chrome и оставлял контейнер БЕЗ форвардера: «Chrome есть,
+# CDP refused» — агент молча падал в headless (инцидент 26.09).
+if ss -tlnp 2>/dev/null | grep -q ":9223"; then
+    echo "[✅ Chrome] TCP-forwarder уже слушает 9223"
+else
+    pkill -f "python3.*tcp_forward.py" || true
+    python3 "$SCRIPT_DIR/tcp_forward.py" > /dev/null 2>&1 &
+    echo "[🔧 Chrome] TCP-forwarder поднят на 9223"
+fi
+
 # Проверяем, не запущен ли уже Chrome с CDP
 if ss -tlnp 2>/dev/null | grep -q ":${CDP_PORT}"; then
     echo "[✅ Chrome] Уже запущен на порту ${CDP_PORT}"
@@ -15,12 +27,6 @@ fi
 
 # Убираем leftover lock (бывает после kill -9)
 rm -f ~/.config/google-chrome/SingletonLock 2>/dev/null
-
-# Убиваем старый forwarder, если был
-pkill -f "python3.*tcp_forward.py" || true
-
-# Запускаем TCP forwarder в бэкграунде
-python3 "$SCRIPT_DIR/tcp_forward.py" > /dev/null 2>&1 &
 
 echo "[🚀 Chrome] Запускаю Chrome с GUI и CDP на порту ${CDP_PORT}..."
 exec "$CHROME_BIN" \

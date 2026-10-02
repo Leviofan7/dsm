@@ -1,16 +1,14 @@
-import { NextResponse } from "next/server"
+import { NextRequest, NextResponse } from "next/server"
+import { backendUrl, relayBackendResponse, sessionHeaders } from "@/lib/backend-proxy"
 
-const BACKEND_URL = "http://localhost:8000"
-
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
-    const res = await fetch(`${BACKEND_URL}/agents/list`, {
+    const res = await fetch(`${backendUrl()}/agents/list`, {
+      headers: sessionHeaders(req),
       cache: "no-store",
     })
-    if (!res.ok) throw new Error(`Backend: ${res.status}`)
-    return NextResponse.json(await res.json())
-  } catch (error) {
-    console.error("Failed to fetch agents:", error)
-    return NextResponse.json({ error: "Failed to fetch agents" }, { status: 500 })
+    return await relayBackendResponse(res)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }

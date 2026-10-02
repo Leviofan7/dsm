@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useRef, useEffect } from "react"
+import { memo, useState, useRef, useEffect } from "react"
 import { Bot, User, Copy, Pencil, Trash2, Check, X } from "lucide-react"
 import type { ChatMessage } from "@/lib/data"
 import { cn } from "@/lib/utils"
@@ -8,7 +8,7 @@ import { Citations } from "@/components/chat/citations"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 
-export function MessageBubble({
+export const MessageBubble = memo(function MessageBubbleInner({
   message,
   onDelete,
   onEdit,
@@ -197,4 +197,4 @@ export function MessageBubble({
       </div>
     </div>
   )
-}
+})

@@ -47,3 +47,10 @@ Session: 133f9f1c-cd56-43cc-9a3b-d046e8256aea
 
 ---
 **Status**: Audit complete. No session-specific trace found; reporting on global trends.
+
+## Meta-Analyst Analysis (2026-08-31 19:56:46)
+Session: 977857e0-11da-4552-a55a-b426db50e199
+The user wants me to perform an audit on a specific session ID (977857e0-11da-4552-a55a-b426db50e199) following the provided algorithm.
+
+Step 1: Call `get_global_analytics()`.
+Step 2: Call `read_session_trace(session_id="977

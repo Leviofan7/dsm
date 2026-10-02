@@ -1,40 +1,36 @@
-import { NextResponse } from "next/server"
-
-const BACKEND_URL = "http://localhost:8000"
+import { NextRequest, NextResponse } from "next/server"
+import { backendUrl, relayBackendResponse, sessionHeaders } from "@/lib/backend-proxy"
 
 export async function PUT(
-  req: Request,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string; msgId: string }> }
 ) {
   try {
     const { id, msgId } = await params
     const body = await req.json()
-    const res = await fetch(`${BACKEND_URL}/conversations/${id}/messages/${msgId}`, {
+    const res = await fetch(`${backendUrl()}/conversations/${id}/messages/${msgId}`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: sessionHeaders(req, { json: true }),
       body: JSON.stringify(body),
     })
-    if (!res.ok) throw new Error(`Backend: ${res.status}`)
-    return NextResponse.json(await res.json())
-  } catch (error) {
-    console.error("Failed to update message:", error)
-    return NextResponse.json({ error: "Failed to update message" }, { status: 500 })
+    return await relayBackendResponse(res)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }
 
 export async function DELETE(
-  req: Request,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string; msgId: string }> }
 ) {
   try {
     const { id, msgId } = await params
-    const res = await fetch(`${BACKEND_URL}/conversations/${id}/messages/${msgId}`, {
+    const res = await fetch(`${backendUrl()}/conversations/${id}/messages/${msgId}`, {
       method: "DELETE",
+      headers: sessionHeaders(req),
     })
-    if (!res.ok) throw new Error(`Backend: ${res.status}`)
-    return NextResponse.json(await res.json())
-  } catch (error) {
-    console.error("Failed to delete message:", error)
-    return NextResponse.json({ error: "Failed to delete message" }, { status: 500 })
+    return await relayBackendResponse(res)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }

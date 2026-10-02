@@ -14,8 +14,13 @@ RUN apt-get update && apt-get install -y \
     libgtk-3-0 \
     libgbm-dev \
     curl \
-    nodejs \
-    npm \
+    xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# DSH requires Node.js ^22.19.0 or newer.
+RUN curl -fsSL https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz -o /tmp/node.tar.xz \
+    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+    && rm /tmp/node.tar.xz \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Claude Code CLI

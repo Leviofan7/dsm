@@ -38,13 +38,13 @@ async def goto_url(url: str) -> str:
     STEALTH_WARMUP_ENABLED = os.environ.get("STEALTH_WARMUP_ENABLED", "True").lower() in ["true", "1", "yes"]
     if STEALTH_WARMUP_ENABLED:
         import random
-        print("[*] Запуск ритуала приземления (поведенческий прогрев)...")
+        print("[*] Запуск ритуала приземления (поведенческий прогрев)...", file=sys.stderr)
         await asyncio.sleep(random.uniform(0.5, 1.2))
         await browser.simulate_mouse_wandering()
         await browser.simulate_exploratory_scroll()
         await browser.hover_neutral_element()
         await browser.simulate_text_selection()
-        print("[*] Прогрев завершен. Страница готова к анализу ИИ.")
+        print("[*] Прогрев завершен. Страница готова к анализу ИИ.", file=sys.stderr)
         
         # 3. Проверка блокировки ПОСЛЕ прогрева (агрессивный антифрод)
         blocked_late = await browser.detect_access_denied()

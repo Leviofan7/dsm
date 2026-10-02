@@ -1,40 +1,36 @@
-import { NextResponse } from "next/server"
-
-const BACKEND_URL = "http://localhost:8000"
+import { NextRequest, NextResponse } from "next/server"
+import { backendUrl, relayBackendResponse, sessionHeaders } from "@/lib/backend-proxy"
 
 export async function PUT(
-  req: Request,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const { id } = await params
     const body = await req.json()
-    const res = await fetch(`${BACKEND_URL}/conversations/${id}`, {
+    const res = await fetch(`${backendUrl()}/conversations/${id}`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: sessionHeaders(req, { json: true }),
       body: JSON.stringify(body),
     })
-    if (!res.ok) throw new Error(`Backend: ${res.status}`)
-    return NextResponse.json(await res.json())
-  } catch (error) {
-    console.error("Failed to update conversation:", error)
-    return NextResponse.json({ error: "Failed to update" }, { status: 500 })
+    return await relayBackendResponse(res)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }
 
 export async function DELETE(
-  req: Request,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const { id } = await params
-    const res = await fetch(`${BACKEND_URL}/conversations/${id}`, {
+    const res = await fetch(`${backendUrl()}/conversations/${id}`, {
       method: "DELETE",
+      headers: sessionHeaders(req),
     })
-    if (!res.ok) throw new Error(`Backend: ${res.status}`)
-    return NextResponse.json(await res.json())
-  } catch (error) {
-    console.error("Failed to delete conversation:", error)
-    return NextResponse.json({ error: "Failed to delete" }, { status: 500 })
+    return await relayBackendResponse(res)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }

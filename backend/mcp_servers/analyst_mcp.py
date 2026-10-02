@@ -6,7 +6,7 @@ import sys
 # Ensure backend directory is in path to import database and models
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from database import SessionLocal
-from models import ExecutionTrace, PendingPrivilegedAction
+from models import ExecutionTrace
 
 mcp = FastMCP("analyst_mcp")
 
@@ -82,41 +82,37 @@ def get_global_analytics() -> str:
 def propose_prompt_update(target_persona: str, new_prompt: str, reasoning: str, session_id: str = "") -> str:
     """Регистрирует предложение по изменению системного промпта персоны.
     НЕ применяет изменение — только создаёт запись на approval."""
-    db = SessionLocal()
-    try:
-        action = PendingPrivilegedAction(
-            action_type="prompt_update",
-            target=target_persona,
-            instruction=new_prompt,
-            reasoning=reasoning,
-            session_id=session_id or None,
-            status="awaiting_approval",
-        )
-        db.add(action)
-        db.commit()
-        return f"Предложение по промпту для '{target_persona}' зарегистрировано (id={action.id}), ожидает подтверждения человека."
-    finally:
-        db.close()
+    from services.human_queue import ORIGIN_META_ANALYST, create_human_request
+
+    request_id = create_human_request(
+        action_type="prompt_update",
+        payload={"target": target_persona, "instruction": new_prompt, "reasoning": reasoning},
+        origin=ORIGIN_META_ANALYST,
+        session_id=session_id or None,
+        summary=f"Обновление промпта роли: {target_persona}",
+    )
+    return (
+        f"Предложение по промпту для '{target_persona}' зарегистрировано в единой очереди "
+        f"(id={request_id}), человек уведомлён в Telegram. Изменение НЕ применено."
+    )
 
 @mcp.tool()
 def propose_coder_task(target_file: str, instruction: str, reasoning: str, session_id: str = "") -> str:
     """Регистрирует ТЗ для Claude Code. НЕ вызывает coder напрямую —
     создаёт запись, которая появится в UI для approve человеком."""
-    db = SessionLocal()
-    try:
-        action = PendingPrivilegedAction(
-            action_type="coder_task",
-            target=target_file,
-            instruction=instruction,
-            reasoning=reasoning,
-            session_id=session_id or None,
-            status="awaiting_approval",
-        )
-        db.add(action)
-        db.commit()
-        return f"ТЗ для правки '{target_file}' зарегистрировано (id={action.id}), ожидает подтверждения человека."
-    finally:
-        db.close()
+    from services.human_queue import ORIGIN_META_ANALYST, create_human_request
+
+    request_id = create_human_request(
+        action_type="coder_task",
+        payload={"target": target_file, "instruction": instruction, "reasoning": reasoning},
+        origin=ORIGIN_META_ANALYST,
+        session_id=session_id or None,
+        summary=f"Задача кодеру: {target_file}",
+    )
+    return (
+        f"ТЗ для правки '{target_file}' зарегистрировано в единой очереди (id={request_id}), "
+        "человек уведомлён в Telegram. Кодер НЕ запущен до approve."
+    )
 
 # ─── Apprentice-Gate 2.0: Инструменты для Надсмотрщика (Supervisor 14B) ────────
 @mcp.tool()

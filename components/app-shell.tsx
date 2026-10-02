@@ -3,7 +3,7 @@
 import Link from "next/link"
 import { usePathname } from "next/navigation"
 import type { ReactNode } from "react"
-import { Boxes, BarChart2, Database, MessagesSquare, Settings, Sparkles } from "lucide-react"
+import { Boxes, BarChart2, Database, MessagesSquare, Settings, Sparkles, Bot, Shield } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 
@@ -11,6 +11,8 @@ const nav = [
   { href: "/", label: "Data Sources", icon: Database },
   { href: "/chat", label: "Chat", icon: MessagesSquare },
   { href: "/analytics", label: "Analytics", icon: BarChart2 },
+  { href: "/agents", label: "Agents", icon: Bot },
+  { href: "/users", label: "Users", icon: Shield },
   { href: "/settings", label: "Settings", icon: Settings },
 ]
 

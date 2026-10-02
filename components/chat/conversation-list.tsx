@@ -1,7 +1,7 @@
 "use client"
 
 import { useState } from "react"
-import { MessageSquarePlus, Trash2, Pencil, Check, X } from "lucide-react"
+import { MessageSquarePlus, Trash2, Pencil, Check, X, Send } from "lucide-react"
 import type { Conversation } from "@/lib/data"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -83,7 +83,10 @@ export function ConversationList({
             </div>
           ) : (
             <>
-              <span className="flex-1 truncate text-xs font-medium">{conv.title}</span>
+              <span className="flex-1 truncate text-xs font-medium flex items-center gap-1.5">
+                {conv.telegram_chat_id && <Send className="size-3 text-blue-500 shrink-0" />}
+                {conv.title}
+              </span>
               <div className="flex items-center gap-0.5 opacity-50 transition-opacity group-hover:opacity-100 focus-within:opacity-100 md:opacity-0">
                 <button
                   onClick={(e) => { e.stopPropagation(); startRename(conv) }}

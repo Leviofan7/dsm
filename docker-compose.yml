@@ -5,6 +5,8 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    env_file:
+      - .env
     container_name: contextus_backend
     restart: unless-stopped
     shm_size: '2gb'
@@ -14,8 +16,12 @@ services:
     environment:
       - ALLOWED_TELEGRAM_USER_ID=${ALLOWED_TELEGRAM_USER_ID}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET}
+      - WEB_AUTH_SECRET=${WEB_AUTH_SECRET}
       - OLLAMA_URL=http://host.docker.internal:11434
       - PROJECT_ROOT=/app/project_workspace
+      - CODER_SANDBOX_DIR=/tmp/coder_sandbox
+      - SANDBOX_TTL_HOURS=${SANDBOX_TTL_HOURS:-24}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
@@ -67,6 +73,8 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    env_file:
+      - .env
     container_name: contextus_worker
     restart: unless-stopped
     shm_size: '2gb'
@@ -74,8 +82,12 @@ services:
     environment:
       - ALLOWED_TELEGRAM_USER_ID=${ALLOWED_TELEGRAM_USER_ID}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET}
+      - WEB_AUTH_SECRET=${WEB_AUTH_SECRET}
       - OLLAMA_URL=http://host.docker.internal:11434
       - PROJECT_ROOT=/app/project_workspace
+      - CODER_SANDBOX_DIR=/tmp/coder_sandbox
+      - SANDBOX_TTL_HOURS=${SANDBOX_TTL_HOURS:-24}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}

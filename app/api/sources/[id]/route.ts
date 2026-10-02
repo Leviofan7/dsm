@@ -1,25 +1,18 @@
-import { NextResponse } from "next/server"
-
-const BACKEND_URL = "http://localhost:8000"
+import { NextRequest, NextResponse } from "next/server"
+import { backendUrl, relayBackendResponse, sessionHeaders } from "@/lib/backend-proxy"
 
 export async function DELETE(
-  req: Request,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const { id } = await params
-    const res = await fetch(`${BACKEND_URL}/sources/${id}`, {
+    const res = await fetch(`${backendUrl()}/sources/${id}`, {
       method: "DELETE",
+      headers: sessionHeaders(req),
     })
-    
-    if (!res.ok) {
-      throw new Error(`Backend responded with status: ${res.status}`)
-    }
-    
-    const data = await res.json()
-    return NextResponse.json(data)
-  } catch (error) {
-    console.error("Failed to delete source:", error)
-    return NextResponse.json({ error: "Failed to delete source" }, { status: 500 })
+    return await relayBackendResponse(res)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }
