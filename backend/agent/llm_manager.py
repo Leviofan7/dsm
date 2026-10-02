@@ -45,6 +45,10 @@ from .model_catalog import (
 from .session_state import session_manager, SessionState
 from services.dom_utils import calculate_dom_hash
 from services.role_permissions import CALLER_ROLE_META_KEY
+# Служебный канал `_meta`: роль (intent-тулы) и id прогона (artifacts-тулы).
+# Имена artifacts-тулов берём из сервиса, чтобы список не расползался копиями.
+from services.mcp_meta import CALLER_TASK_META_KEY
+from services.artifacts import ARTIFACT_TOOLS
 
 logger = logging.getLogger("contextus.llm_manager")
 
@@ -995,7 +999,7 @@ class LLMManager:
         task_type = target_agent
 
         # Модели и MCP-серверы из настроек агента (config/agent_configs.json)
-        allowed_servers = ["workspace", "fs-tools", "coder", "contextus-rag", "analyst-mcp"] # Default base servers
+        allowed_servers = ["workspace", "fs-tools", "coder", "contextus-rag", "analyst-mcp", "artifacts"] # Default base servers
         model, conf = resolve_agent_model(self.registry, task_type, complexity, model_override, query=query)
         extra_mcps = conf.get("extra_mcps")
         if isinstance(extra_mcps, list):
@@ -1388,7 +1392,7 @@ class LLMManager:
                                     corrected_mark = True
 
                         try:
-                            res = await self._call_tool(tool_name, tool_args, target_role)
+                            res = await self._call_tool(tool_name, tool_args, target_role, task_id)
                             if mode == "apprentice" and corrected_mark:
                                 corrected_note = f"[System: Оператор скорректировал твои аргументы для инструмента {tool_name}. Ниже представлен результат выполнения с учетом правок.]\n"
                                 res = corrected_note + res
@@ -1588,7 +1592,7 @@ class LLMManager:
                             corrected_mark = True
 
                 try:
-                    res = await self._call_tool(tool_name, tool_args, task_type)
+                    res = await self._call_tool(tool_name, tool_args, task_type, task_id)
                     if mode == "apprentice" and corrected_mark:
                         res = f"[System: Оператор скорректировал твои аргументы для инструмента {tool_name}. Ниже представлен результат выполнения с учетом правок.]\n" + res
                     
@@ -1961,26 +1965,39 @@ class LLMManager:
             logger.info(f"  🧩 [{role}] intent-тулы не выданы по правам роли: {removed}")
         return filtered
 
-    def _role_meta(self, tool_name: str, role: str) -> dict[str, str] | None:
+    def _role_meta(self, tool_name: str, role: str, task_id: str | None = None) -> dict[str, str] | None:
         """
-        Служебный _meta для intent-тулов: роль вызывающего (Фаза B).
+        Служебный _meta для MCP-инструментов: роль вызывающего и id прогона.
 
-        Роль НЕ кладётся в аргументы инструмента: их генерирует LLM (и в режиме
-        apprentice их может подменить оператор), поэтому в args она была бы
-        управляема извне. _meta — protocol-level канал, модель его не видит
+        Ни роль, ни id прогона НЕ кладутся в аргументы инструмента: их генерирует LLM
+        (в режиме apprentice их может подменить оператор), поэтому в args они были бы
+        управляемы извне — агент мог бы опубликовать артефакт в чужую задачу или
+        представиться другой ролью. _meta — protocol-level канал: модель его не видит
         и в схеме инструмента он не отражается.
         """
-        if not tool_name.startswith("intent_"):
-            return None
-        return {CALLER_ROLE_META_KEY: (role or "").strip()}
+        if tool_name.startswith("intent_"):
+            return {CALLER_ROLE_META_KEY: (role or "").strip()}
 
-    async def _call_tool(self, tool_name: str, tool_args: dict, role: str) -> str:
+        if tool_name in ARTIFACT_TOOLS:
+            meta = {CALLER_ROLE_META_KEY: (role or "").strip()}
+            # Прогона нет (Telegram-путь) — тул откажет сам: артефакт без владельца
+            # нельзя ни показать, ни прибрать вместе с задачей.
+            if task_id:
+                meta[CALLER_TASK_META_KEY] = str(task_id)
+            return meta
+
+        return None
+
+    async def _call_tool(
+        self, tool_name: str, tool_args: dict, role: str, task_id: str | None = None
+    ) -> str:
         """
         Единая точка вызова MCP-инструмента.
-        Для intent-тулов добавляет служебный _meta с ролью; для остальных — вызов как раньше
-        (лишний kwarg не тащим: фейки/старые серверы остаются совместимыми).
+        Для intent- и artifacts-тулов добавляет служебный _meta (роль, id прогона);
+        для остальных — вызов как раньше (лишний kwarg не тащим: фейки/старые серверы
+        остаются совместимыми).
         """
-        meta = self._role_meta(tool_name, role)
+        meta = self._role_meta(tool_name, role, task_id)
         if meta:
             return await self.mcp.call_tool(tool_name, tool_args, meta=meta)
         return await self.mcp.call_tool(tool_name, tool_args)

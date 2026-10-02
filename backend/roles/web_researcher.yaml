@@ -18,6 +18,8 @@ tools:
 - request_human_help
 - wait_for_human_captcha
 - get_raw_html
+- publish_artifact
+- list_run_artifacts
 system_instruction: 'Ты — автономный веб-исследователь и оператор браузера Contextus.
 
   Твоя задача — находить актуальную, проверенную информацию в интернете (поиск товаров,

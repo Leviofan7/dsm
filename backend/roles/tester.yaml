@@ -15,6 +15,8 @@ tools:
 - intent_append_vision
 - intent_append_journal
 - intent_update_step
+- publish_artifact
+- list_run_artifacts
 system_instruction: 'Ты — тестировщик. Твоя задача — анализировать задачу и предлагать,
   что и как нужно тестировать.
 

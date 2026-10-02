@@ -6,14 +6,57 @@ import json
 # Ensure backend directory is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from agent.browser import BrowserSession
+from services.mcp_meta import caller_role, caller_task_id
 
 # Create FastMCP server instance
 mcp = FastMCP("web-stealth", instructions="Browser automation server with stealth capabilities and human-like interaction")
 
 # Global browser session state
 browser = BrowserSession(headless=False)
+
+
+def _publish_screenshot(ctx, b64: str, note: str = "") -> None:
+    """
+    Складывает скриншот в артефакты прогона (панель «Артефакты»).
+
+    Раньше скриншоты уезжали только в Telegram и бесследно исчезали для истории.
+    Прогона нет (Telegram-путь) — писать некуда, поэтому молча выходим. Ошибки здесь
+    глотаются сознательно: главная работа инструмента — вернуть картинку в любом случае,
+    а сломанный артефакт не должен ломать анализ страницы.
+    """
+    task_id = caller_task_id(ctx)
+    if not task_id or not b64:
+        return
+    try:
+        import base64
+        from datetime import datetime
+        from database import SessionLocal
+        from services import artifacts as artifacts_service
+
+        try:
+            url = browser.page.url if browser.page else ""
+        except Exception:
+            url = ""
+        db = SessionLocal()
+        try:
+            row = artifacts_service.save_file(
+                db,
+                task_id=task_id,
+                filename=f"screenshot_{datetime.utcnow():%H%M%S}.png",
+                data=base64.b64decode(b64),
+                kind="image",
+                title=(f"Скриншот {url}" if url else "Скриншот страницы")[:255],
+                mime="image/png",
+                origin="agent",
+                meta={"role": caller_role(ctx) or None, "url": url, "note": note or None},
+            )
+            print(f"[*] Скриншот в артефактах прогона: {row.id}", file=sys.stderr)
+        finally:
+            db.close()
+    except Exception as e:  # noqa: BLE001 — диагностика важнее строгости типов исключений
+        print(f"[!] Не удалось сохранить скриншот в артефакты: {e}", file=sys.stderr)
 
 
 @mcp.tool()
@@ -82,11 +125,14 @@ async def get_dom_map() -> str:
 
 
 @mcp.tool()
-async def take_screenshot() -> str:
+async def take_screenshot(ctx: Context) -> str:
     """Takes a screenshot of the current viewport. Returns a base64 encoded string. Use for visual analysis when DOM map is insufficient or to verify page state."""
     if not browser.page:
         return "Error: Browser not started or page not loaded."
-    return await browser.take_screenshot()
+    data = await browser.take_screenshot()
+    # Скриншот остаётся для истории прогона, а не только в текущем ответе (фаза 3)
+    _publish_screenshot(ctx, data, note="take_screenshot")
+    return data
 
 
 @mcp.tool()

@@ -10,6 +10,8 @@ tools:
 - list_dir
 - propose_coder_task
 - propose_prompt_update
+- publish_artifact
+- list_run_artifacts
 system_instruction: "Ты — опытный Software Architect.\nТвоя задача — анализировать\
   \ кодовую базу (используя инструменты `read_file` и `list_dir`) \nи планировать\
   \ чистую, поддерживаемую архитектуру для решения поставленной задачи.\n\nВНИМАНИЕ:\

@@ -27,10 +27,16 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from models import AgentSubtask, AgentTask, Artifact, RunJournal
+from models import AgentSubtask, AgentTask, Artifact, ExecutionTrace, RunJournal
 
 #: Закрытый список типов: UI рассчитывает на превью для каждого из них.
 KINDS = ("plan", "file", "image", "text", "report", "link", "error_dump")
+
+#: Имена MCP-инструментов этого сервиса — единый источник для оркестратора и сервера.
+ARTIFACT_TOOLS = ("publish_artifact", "list_run_artifacts")
+
+#: Потолок размера файла, который агент может опубликовать (защита от «приложил образ диска»).
+MAX_AGENT_FILE_BYTES = 20 * 1024 * 1024
 
 
 def artifacts_root() -> Path:
@@ -74,6 +80,7 @@ def publish(
     meta: dict[str, Any] | None = None,
     ref_type: str | None = None,
     ref_id: str | None = None,
+    dedup: bool = True,
 ) -> Artifact:
     """Единая точка публикации: сама понимает, где лежит содержимое (db/disk/url)."""
     if kind not in KINDS:
@@ -97,6 +104,22 @@ def publish(
         encoded = content.encode("utf-8")
         size_bytes = size_bytes if size_bytes is not None else len(encoded)
         sha256 = sha256 or _sha256_bytes(encoded)
+
+    if dedup and sha256:
+        # Тот же результат в той же задаче — та же карточка. Без этого цикл браузера
+        # набивал панель десятками одинаковых скриншотов/отчётов.
+        existing = (
+            db.query(Artifact)
+            .filter(
+                Artifact.task_id == task_id,
+                Artifact.sha256 == sha256,
+                Artifact.kind == kind,
+                Artifact.deleted_at.is_(None),
+            )
+            .first()
+        )
+        if existing is not None:
+            return existing
 
     row = Artifact(
         id=str(uuid.uuid4()),
@@ -234,7 +257,8 @@ def artifact_card(a: Artifact, *, inline_limit: int = 20000) -> dict[str, Any]:
     return card
 
 
-def _journal_card(j: RunJournal) -> dict[str, Any]:
+def journal_card(j: RunJournal) -> dict[str, Any]:
+    """Карточка журнала для API/панели (публичная: нужна и эндпоинту /tasks/{id}/journal)."""
     def load(raw: str | None):
         return json.loads(raw) if raw else None
 
@@ -276,7 +300,7 @@ def list_for_task(db: Session, task_id: str) -> dict[str, Any] | None:
         },
         "plan": {"steps": steps, "markdown": render_plan(steps)} if steps else None,
         "artifacts": [artifact_card(a) for a in artifacts],
-        "journal": _journal_card(journal) if journal else None,
+        "journal": journal_card(journal) if journal else None,
     }
 
 
@@ -361,3 +385,199 @@ def runs_for_conversation(db: Session, conversation_id: str, limit: int = 50) ->
             }
         )
     return runs
+
+
+# ── Фаза 3: что агент может опубликовать сам ───────────────────────
+
+def project_root() -> Path:
+    """Корень проекта — тот же PROJECT_ROOT, что у файловых MCP-инструментов."""
+    return Path(os.getenv("PROJECT_ROOT") or ".").resolve()
+
+
+def read_agent_file(raw_path: str) -> bytes:
+    """
+    Читает файл, который агент решил опубликовать, — с проверками.
+
+    Почему не просто open(): путь приходит аргументом MCP-инструмента, то есть от модели.
+    Без проверок модель могла бы выложить в панель содержимое `/etc/passwd`, ключи из
+    окружения или симлинк куда угодно — а артефакт скачивается руками администратора.
+    Поэтому разрешены только обычные файлы внутри PROJECT_ROOT (или внутри корня артефактов),
+    не симлинки, с потолком размера.
+    """
+    if not raw_path or not str(raw_path).strip():
+        raise ValueError("path не задан")
+
+    candidate = Path(str(raw_path).strip())
+    if not candidate.is_absolute():
+        candidate = project_root() / candidate
+    candidate = candidate.resolve()
+
+    allowed_roots = [project_root(), artifacts_root().resolve()]
+    if not any(str(candidate).startswith(str(root) + os.sep) for root in allowed_roots):
+        raise ValueError("path вне PROJECT_ROOT — публиковать можно только файлы проекта")
+    if candidate.is_symlink() or not candidate.is_file():
+        raise ValueError("path не является обычным файлом")
+
+    size = candidate.stat().st_size
+    if size > MAX_AGENT_FILE_BYTES:
+        raise ValueError(f"файл слишком большой: {size} байт (потолок {MAX_AGENT_FILE_BYTES})")
+    return candidate.read_bytes()
+
+
+# ── Журнал: метрики из трейсов и паттерны ────────────────────────
+
+def collect_metrics(db: Session, task_id: str) -> dict[str, Any]:
+    """
+    Метрики прогона из `execution_traces` — данные уже собраны, дублировать их не нужно.
+
+    До этого журнал знал только про «события»: модели, длительность, тул-коллы и ошибки
+    лежали в таблице, которую никто не читает глазами («система знает, но не помнит»).
+    """
+    traces = db.query(ExecutionTrace).filter(ExecutionTrace.task_id == task_id).all()
+    if not traces:
+        return {}
+
+    models = sorted(
+        {(t.model_selected or t.model_used) for t in traces if (t.model_selected or t.model_used)}
+    )
+    tool_names: list[str] = []
+    for t in traces:
+        try:
+            names = json.loads(t.tools_called_names) if t.tools_called_names else []
+        except Exception:
+            names = []
+        if isinstance(names, list):
+            tool_names.extend(str(n) for n in names)
+
+    return {
+        "traces": len(traces),
+        "duration_ms": sum(int(t.duration_ms or 0) for t in traces),
+        "tokens_in": sum(int(t.tokens_in or 0) for t in traces),
+        "tokens_out": sum(int(t.tokens_out or 0) for t in traces),
+        "models": models,
+        "tool_calls": sum(int(t.tools_called or 0) for t in traces),
+        "tools": sorted(set(tool_names)),
+        "statuses": sorted({t.final_status for t in traces if t.final_status}),
+    }
+
+
+def trace_errors(db: Session, task_id: str) -> list[str]:
+    """Ошибки из трейсов (обрезанные): журнал — сводка, а не свалка логов."""
+    out: list[str] = []
+    for t in db.query(ExecutionTrace).filter(ExecutionTrace.task_id == task_id).all():
+        text = str(t.errors or "").strip()
+        if text and text not in out:
+            out.append(text[:400])
+    return out
+
+
+def _achievements_from_run(db: Session, task_id: str) -> list[str]:
+    """Достижения по факту: сколько шагов плана закрыто и что именно осталось в результате."""
+    steps = plan_steps(db, task_id)
+    done = [s for s in steps if s["status"] == "completed"]
+    kinds = dict(
+        db.query(Artifact.kind, func.count(Artifact.id))
+        .filter(Artifact.task_id == task_id, Artifact.deleted_at.is_(None))
+        .group_by(Artifact.kind)
+        .all()
+    )
+    out: list[str] = []
+    if steps:
+        out.append(f"план: завершено {len(done)}/{len(steps)} шагов")
+    if kinds:
+        out.append("результаты: " + ", ".join(f"{k}×{v}" for k, v in sorted(kinds.items())))
+    return out
+
+
+def finalize_journal(
+    db: Session,
+    task_id: str,
+    *,
+    status: str,
+    summary: str | None = None,
+    errors: list | None = None,
+    achievements: list | None = None,
+    self_review: str | None = None,
+    tags: str | None = None,
+) -> RunJournal:
+    """
+    Итог прогона одной записью: то, что знает воркер + метрики и ошибки из трейсов.
+
+    Вызывается из всех трёх исходов (успех/отмена/падение): раньше журнал писался
+    «на глазок», и ошибка прогона оставалась только в логе контейнера.
+    """
+    metrics = collect_metrics(db, task_id)
+    merged = list(errors or [])
+    for err in trace_errors(db, task_id):
+        if err not in merged:
+            merged.append(err)
+    if achievements is None:
+        achievements = _achievements_from_run(db, task_id)
+    if summary is None and achievements:
+        # Сводка по фактам, а не «всё хорошо»: план и то, что осталось в результате.
+        summary = "; ".join(achievements)
+
+    return upsert_journal(
+        db,
+        task_id,
+        status=status,
+        summary=summary,
+        errors=merged or None,
+        achievements=achievements or None,
+        metrics=metrics or None,
+        self_review=self_review,
+        tags=tags,
+    )
+
+
+_NORM_DIGITS = re.compile(r"\d+")
+_NORM_PATHS = re.compile(r"[^\s\"']*[/\\][^\s\"']*")
+
+
+def _error_signature(text: str) -> str:
+    """Грубая нормализация ошибки для группировки: числа и пути → плейсхолдеры."""
+    return _NORM_PATHS.sub("<path>", _NORM_DIGITS.sub("<n>", text.strip().lower()))[:160]
+
+
+def journal_patterns(db: Session, limit: int = 100) -> dict[str, Any]:
+    """
+    Сводка по последним прогонам — самоанализ минимальными средствами.
+
+    Журнал ценен не поодиночке, а паттернами («падает на капче», «модель X не тянет»).
+    Здесь только агрегаты по уже записанным журналам: без LLM и без новых таблиц —
+    ровно то, что можно утверждать по имеющимся данным.
+    """
+    rows = db.query(RunJournal).order_by(RunJournal.created_at.desc()).limit(limit).all()
+    by_status: dict[str, int] = {}
+    durations: list[int] = []
+    signatures: dict[str, dict[str, Any]] = {}
+
+    for row in rows:
+        by_status[row.status] = by_status.get(row.status, 0) + 1
+        try:
+            metrics = json.loads(row.metrics) if row.metrics else {}
+        except Exception:
+            metrics = {}
+        if isinstance(metrics, dict):
+            try:
+                durations.append(int(metrics.get("duration_ms") or 0))
+            except Exception:
+                pass
+        try:
+            errs = json.loads(row.errors) if row.errors else []
+        except Exception:
+            errs = []
+        for err in errs if isinstance(errs, list) else []:
+            key = _error_signature(str(err))
+            entry = signatures.setdefault(key, {"count": 0, "sample": str(err)[:200]})
+            entry["count"] += 1
+
+    total = len(rows)
+    success = by_status.get("success", 0)
+    return {
+        "window": total,
+        "by_status": by_status,
+        "success_rate": round(success / total, 3) if total else None,
+        "avg_duration_ms": int(sum(durations) / len(durations)) if durations else None,
+        "top_errors": sorted(signatures.values(), key=lambda e: e["count"], reverse=True)[:5],
+    }

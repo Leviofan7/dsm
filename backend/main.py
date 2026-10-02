@@ -1856,7 +1856,21 @@ async def activate_scenario(
     steps = json.loads(scenario.steps)
     # Проверка на PRIVILEGED_TOOLS
     from agent.mcp_manager import PRIVILEGED_TOOLS
-    
+
+    # Сценарий из прогона приходит черновиком с пустыми args_template: активировать его
+    # значило бы «вызови инструменты наугад». Пока аргументы не заполнены руками —
+    # это заготовка для человека, а не автоматизация.
+    missing_args = [s.get("tool") for s in steps if not s.get("args_template")]
+    if missing_args:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "У шагов не заполнены аргументы: "
+                + ", ".join(str(m) for m in missing_args)
+                + ". Заполните args_template и активируйте снова."
+            ),
+        )
+
     for step in steps:
         tool_name = step.get("tool")
         if tool_name in PRIVILEGED_TOOLS:
@@ -2391,3 +2405,44 @@ def delete_artifact(artifact_id: str, db: Session = Depends(get_db)):
     row.deleted_at = datetime.utcnow()
     db.commit()
     return {"status": "deleted", "id": artifact_id}
+
+
+# ── ЖУРНАЛ ПРОГОНОВ И СЦЕНАРИИ ИЗ НИХ (фазы 3–4) ────────────────────────────
+
+from services import scenarios as scenarios_service  # noqa: E402
+
+
+@app.get("/tasks/{task_id}/journal", dependencies=[Depends(require_admin)])
+def get_task_journal(task_id: str, db: Session = Depends(get_db)):
+    """Исход прогона отдельным запросом: сводка, ошибки, достижения, метрики, self_review."""
+    row = db.query(models.RunJournal).filter(models.RunJournal.task_id == task_id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Journal not found")
+    return artifacts_service.journal_card(row)
+
+
+@app.get("/journals/patterns", dependencies=[Depends(require_admin)])
+def get_journal_patterns(limit: int = 100, db: Session = Depends(get_db)):
+    """
+    Паттерны по последним прогонам: доля успеха, средняя длительность, частые ошибки.
+
+    Это и есть «самоанализ» в минимальном виде: только агрегаты по записанным журналам,
+    без LLM и без новых таблиц. По ним видно, где система спотыкается системно.
+    """
+    return artifacts_service.journal_patterns(db, limit=limit)
+
+
+@app.post("/tasks/{task_id}/scenario", dependencies=[Depends(require_admin)])
+def propose_scenario_from_run(task_id: str, db: Session = Depends(get_db)):
+    """
+    Предлагает сценарий по удачному прогону (черновик, `run_journal.scenario_proposed_id`).
+
+    Ничего не активирует: черновик содержит последовательность инструментов без аргументов,
+    поэтому включать его может только человек — через существующий путь draft → active.
+    """
+    try:
+        scenario, created = scenarios_service.propose_from_run(db, task_id)
+    except ValueError as e:
+        # Честный отказ вместо пустышки: неудачный прогон или прогон без вызовов инструментов
+        raise HTTPException(status_code=400, detail=str(e))
+    return scenarios_service.scenario_card(scenario, created=created)

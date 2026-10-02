@@ -10,6 +10,8 @@ tools:
 - escalate_to_friend_call
 - reject_action
 - request_plan_review
+- publish_artifact
+- list_run_artifacts
 system_instruction: "Ты — строгий локальный Supervisor и QA-контролер процесса разработки.\n\
   Твоя задача — анализировать каждый ActionRequest от автономного Кодера (OmniCoder).\n\
   \nТы ОБЯЗАН использовать один из трёх инструментов. Не давай ответа в чат.\n\nПРАВИЛА\

@@ -13,6 +13,8 @@ tools:
 - get_global_analytics
 - propose_prompt_update
 - propose_coder_task
+- publish_artifact
+- list_run_artifacts
 system_instruction: "Ты — полностью автономный инструмент аудита. Запрещено писать\
   \ вводный текст, здороваться и декларировать намерения.\n\nАЛГОРИТМ (строго по шагам):\n\
   1. Немедленно вызови get_global_analytics() — получи общую статистику.\n2. Немедленно\

@@ -10,9 +10,11 @@ import {
   FileText,
   Loader2,
   RefreshCw,
+  Sparkles,
   Trash2,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { Button } from "@/components/ui/button"
 
 /**
  * Вкладка «Артефакты»: история прогонов беседы и всё, что агент произвёл.
@@ -64,8 +66,9 @@ type RunCard = {
     summary: string | null
     errors: string[] | null
     achievements: string[] | null
-    metrics: Record<string, number | null> | null
+    metrics: Record<string, any> | null
     updated_at: string | null
+    scenario_proposed_id: string | null
   } | null
 }
 
@@ -228,13 +231,25 @@ function RunDetail({ taskId, onToast }: { taskId: string; onToast?: (msg: string
             <div className="flex items-center gap-2">
               <StatusMark status={card.journal.status} />
               <span className="font-medium">{card.journal.status}</span>
-              {card.journal.metrics?.duration_ms ? (
-                <span className="text-muted-foreground">
-                  {(card.journal.metrics.duration_ms / 1000).toFixed(1)} с
-                </span>
-              ) : null}
             </div>
             {card.journal.summary && <p className="mt-1 text-muted-foreground">{card.journal.summary}</p>}
+            {card.journal.metrics && (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                {[
+                  card.journal.metrics.duration_ms
+                    ? `${(Number(card.journal.metrics.duration_ms) / 1000).toFixed(1)} с`
+                    : null,
+                  Array.isArray(card.journal.metrics.models)
+                    ? (card.journal.metrics.models as string[]).join(", ")
+                    : null,
+                  card.journal.metrics.tool_calls
+                    ? `вызовов инструментов: ${card.journal.metrics.tool_calls}`
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </p>
+            )}
             {card.journal.errors?.length ? (
               <ul className="mt-1 space-y-0.5 text-red-500">
                 {card.journal.errors.map((e, i) => (
@@ -255,6 +270,15 @@ function RunDetail({ taskId, onToast }: { taskId: string; onToast?: (msg: string
         </section>
       )}
 
+      {(card.journal?.status === "success" || card.task.status === "completed") && (
+        <section>
+          <h4 className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+            Сценарий
+          </h4>
+          <ProposeScenario taskId={taskId} proposed={card.journal?.scenario_proposed_id} />
+        </section>
+      )}
+
       <section>
         <h4 className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
           Артефакты{card.artifacts.length ? ` · ${card.artifacts.length}` : ""}
@@ -269,6 +293,142 @@ function RunDetail({ taskId, onToast }: { taskId: string; onToast?: (msg: string
           </div>
         )}
       </section>
+    </div>
+  )
+}
+
+type ScenarioCard = {
+  id: string
+  status: string
+  steps: number
+  tools: (string | null)[]
+  needs_args: boolean
+  created: boolean
+  warning: string | null
+}
+
+/**
+ * «Предложить сценарий» — заготовка из удачного прогона.
+ *
+ * Бэкенд честно отказывает (400 + причина), когда повторять нечего: прогон упал
+ * или не вызывал инструментов. Причину показываем как есть, а не «что-то пошло не так».
+ */
+function ProposeScenario({ taskId, proposed }: { taskId: string; proposed?: string | null }) {
+  const [busy, setBusy] = useState(false)
+  const [result, setResult] = useState<ScenarioCard | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const propose = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/scenario`, { method: "POST" })
+      const data = await res.json().catch(() => null)
+      if (!res.ok) {
+        setError(
+          typeof data?.detail === "string" ? data.detail : data?.error || `HTTP ${res.status}`,
+        )
+        return
+      }
+      setResult(data as ScenarioCard)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Не удалось предложить сценарий")
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="space-y-1">
+      <Button size="sm" variant="outline" onClick={propose} disabled={busy} className="h-7 text-[11px]">
+        {busy ? (
+          <Loader2 className="mr-1 size-3 animate-spin" />
+        ) : (
+          <Sparkles className="mr-1 size-3" />
+        )}
+        Предложить сценарий
+      </Button>
+      {proposed && !result && (
+        <p className="text-[11px] text-muted-foreground">Сценарий уже предложен ранее</p>
+      )}
+      {error && <p className="text-[11px] text-destructive">{error}</p>}
+      {result && (
+        <div className="rounded-md border border-border bg-background/60 p-2 text-[11px]">
+          <div className="font-medium">
+            {result.created ? "Черновик создан" : "Такой сценарий уже есть"}: {result.id.slice(0, 8)}…
+          </div>
+          <div className="text-muted-foreground">
+            шагов: {result.steps} · {result.tools.filter(Boolean).join(" → ")}
+          </div>
+          {result.warning && <p className="mt-1 text-amber-600">{result.warning}</p>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+type Patterns = {
+  window: number
+  by_status: Record<string, number>
+  success_rate: number | null
+  avg_duration_ms: number | null
+  top_errors: { count: number; sample: string }[]
+}
+
+/** Сводка по журналам: доля успеха и частые ошибки — это и есть самоанализ в минимуме. */
+function PatternsBar() {
+  const [data, setData] = useState<Patterns | null>(null)
+  const [open, setOpen] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    fetch("/api/journals/patterns", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (alive && d && typeof d.window === "number") setData(d)
+      })
+      .catch(() => {
+        /* нет сводки — не повод ломать панель */
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  if (!data || data.window === 0) return null
+
+  const pct = data.success_rate === null ? "—" : `${Math.round(data.success_rate * 100)}%`
+  return (
+    <div className="mx-2 mb-2 rounded-md border border-border bg-background/40 px-2 py-1.5 text-[11px]">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-1 text-left"
+      >
+        <span className="font-medium">Последние {data.window} прогонов</span>
+        <span className="text-muted-foreground">· успешных {pct}</span>
+        {data.avg_duration_ms ? (
+          <span className="text-muted-foreground">
+            · {Math.round(data.avg_duration_ms / 1000)} с в среднем
+          </span>
+        ) : null}
+        {data.top_errors.length > 0 ?
+          open ? (
+            <ChevronDown className="ml-auto size-3 shrink-0" />
+          ) : (
+            <ChevronRight className="ml-auto size-3 shrink-0" />
+          )
+        : null}
+      </button>
+      {open && data.top_errors.length > 0 && (
+        <ul className="mt-1 space-y-0.5 text-muted-foreground">
+          {data.top_errors.map((e, i) => (
+            <li key={i} className="truncate" title={e.sample}>
+              ×{e.count} — {e.sample}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   )
 }
@@ -340,6 +500,8 @@ export function ArtifactsPanel({
           <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
         </button>
       </div>
+
+      <PatternsBar />
 
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-4">
         {error && <p className="px-2 py-3 text-xs text-destructive">{error}</p>}

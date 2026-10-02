@@ -6,6 +6,7 @@
 файл. Плюс проверяем, что мягкое удаление скрывает карточку, но не стирает историю.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -200,3 +201,96 @@ def test_publish_without_task_is_rejected(client):
         cookies={"contextus_session": cookie},
     )
     assert resp.status_code == 400, "артефакт без владельца создавать нельзя"
+
+
+def test_journal_collects_metrics_and_errors_from_traces(client):
+    """
+    Журнал должен ЗНАТЬ, а не «помнить»: метрики и ошибки берутся из execution_traces.
+
+    До этого ошибки прогона оставались в таблице трейсов, которую глазами никто не читает,
+    а лог контейнера умирал при пересоздании — то самое «запрос испарился».
+    """
+    db = TestingSessionLocal()
+    cookie = _admin_cookie(db)
+    _, task_id = _seed_task(db, with_plan=False)
+    db.add(
+        models.ExecutionTrace(
+            task_id=task_id,
+            session_id="s-1",
+            model_used="deepseek-chat",
+            model_selected="deepseek-chat",
+            tools_called=2,
+            tools_called_names=json.dumps(["web_search", "goto_url"]),
+            duration_ms=1500,
+            actions_log=json.dumps(["web_search", "goto_url"]),
+            errors=json.dumps({"error": "Cloudflare block on npr.org"}),
+        )
+    )
+    db.commit()
+
+    artifacts_service.finalize_journal(db, task_id, status="failed", errors=["RuntimeError: таймаут"])
+    db.close()
+
+    journal = client.get(f"/tasks/{task_id}/journal", cookies={"contextus_session": cookie})
+    assert journal.status_code == 200, journal.text
+    body = journal.json()
+
+    assert body["status"] == "failed"
+    assert body["metrics"]["models"] == ["deepseek-chat"]
+    assert body["metrics"]["tools"] == ["goto_url", "web_search"]
+    assert body["metrics"]["duration_ms"] == 1500
+    errors = " ".join(body["errors"])
+    assert "RuntimeError: таймаут" in errors, "ошибка воркера обязана остаться"
+    assert "Cloudflare block" in errors, "ошибка из трейсов тоже входит в журнал"
+
+    missing = client.get("/tasks/no-such-task/journal", cookies={"contextus_session": cookie})
+    assert missing.status_code == 404
+
+
+def test_journal_patterns_group_errors(client):
+    """Паттерны — минимальный самоанализ: только то, что можно утверждать по журналам."""
+    db = TestingSessionLocal()
+    cookie = _admin_cookie(db)
+    _, first = _seed_task(db, with_plan=False)
+    second = models.AgentTask(owner_id="1", status="failed", query="упал")
+    db.add(second)
+    db.commit()
+
+    artifacts_service.finalize_journal(db, first, status="success")
+    artifacts_service.upsert_journal(
+        db, second.id, status="failed", errors=["Timeout waiting 30s at /app/agent/a.py"]
+    )
+    third = models.AgentTask(owner_id="1", status="failed", query="упал снова")
+    db.add(third)
+    db.commit()
+    artifacts_service.upsert_journal(
+        db, third.id, status="failed", errors=["Timeout waiting 45s at /app/agent/b.py"]
+    )
+    db.close()
+
+    resp = client.get("/journals/patterns", cookies={"contextus_session": cookie})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert body["window"] == 3
+    assert body["by_status"] == {"success": 1, "failed": 2}
+    assert body["success_rate"] == pytest.approx(0.333, abs=0.01)
+    top = body["top_errors"][0]
+    assert top["count"] == 2, "разные таймауты с разными числами/путями — одна ошибка по сути"
+
+
+def test_same_content_publishes_single_card(client):
+    """Дедуп по sha256: один и тот же результат в одной задаче — одна карточка в панели."""
+    db = TestingSessionLocal()
+    cookie = _admin_cookie(db)
+    _, task_id = _seed_task(db, with_plan=False)
+    first = artifacts_service.publish(db, task_id=task_id, kind="report", title="Отчёт", content="одинаковый текст")
+    second = artifacts_service.publish(db, task_id=task_id, kind="report", title="Отчёт", content="одинаковый текст")
+    total = db.query(models.Artifact).filter(models.Artifact.task_id == task_id).count()
+    db.close()
+
+    assert first.id == second.id
+    assert total == 1
+
+    card = client.get(f"/tasks/{task_id}/artifacts", cookies={"contextus_session": cookie}).json()
+    assert len(card["artifacts"]) == 1

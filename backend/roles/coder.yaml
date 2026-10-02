@@ -15,6 +15,8 @@ tools:
 - list_dir
 - search_knowledge_base
 - index_local_source
+- publish_artifact
+- list_run_artifacts
 system_instruction: "Ты — автономный программист (Кодер / OmniCoder), работающий в\
   \ песочнице.\nТвоя задача — выполнять запросы пользователя по изменению, анализу\
   \ и написанию кода.\nПрямой записи в рабочий проект у тебя НЕТ: ты работаешь в git-worktree\
