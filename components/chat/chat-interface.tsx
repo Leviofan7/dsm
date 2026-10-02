@@ -30,6 +30,8 @@ import { ApprenticeCard, type ApprenticeStep } from "@/components/chat/apprentic
 import { AgentThinkingBubble, type AgentThinkingStep } from "@/components/chat/agent-thinking-bubble"
 import { ConversationList } from "@/components/chat/conversation-list"
 import { SourceSelector } from "@/components/chat/source-selector"
+import { ArtifactsPanel } from "@/components/chat/artifacts-panel"
+import { ResizeHandle, useResizablePanel } from "@/components/ui/panel"
 import {
   Dialog,
   DialogContent,
@@ -53,7 +55,9 @@ export function ChatInterface() {
   // --- Messages ---
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState("")
-  const [panelOpen, setPanelOpen] = useState(true)
+  // Ширина/свёрнутость правой панели помнятся между запусками (см. components/ui/panel.tsx)
+  const ctxPanel = useResizablePanel("contextus_ctx_panel", { initial: 320, min: 260, max: 620 })
+  const [panelTab, setPanelTab] = useState<"context" | "artifacts">("context")
 
   // --- File tree ---
   const [fileTreeData, setFileTreeData] = useState<TreeNode[]>([])
@@ -795,8 +799,8 @@ export function ChatInterface() {
               <Bug className="size-4" />
               {debugMode ? <span className="ml-1 text-xs">DEBUG</span> : null}
             </Button>
-            <Button variant="outline" size="sm" onClick={() => setPanelOpen((o) => !o)}>
-              {panelOpen ? <PanelRightClose key="close" className="size-4" /> : <PanelRightOpen key="open" className="size-4" />}
+            <Button variant="outline" size="sm" onClick={() => ctxPanel.toggle()}>
+              {!ctxPanel.collapsed ? <PanelRightClose key="close" className="size-4" /> : <PanelRightOpen key="open" className="size-4" />}
               <span className="hidden sm:inline">Context</span>
             </Button>
           </div>
@@ -901,51 +905,104 @@ export function ChatInterface() {
         )}
       </div>
 
-      {/* RIGHT: File tree panel */}
+      {/* RIGHT: контекст + артефакты. Ширина тянется, панель сворачивается */}
+      {!ctxPanel.collapsed && (
+        <ResizeHandle
+          panel="right"
+          className="hidden lg:block"
+          onResize={ctxPanel.resize}
+          onReset={ctxPanel.reset}
+        />
+      )}
       <aside
         className={cn(
-          "hidden shrink-0 flex-col border-l border-border bg-sidebar transition-all lg:flex",
-          panelOpen ? "w-80" : "w-0 overflow-hidden border-l-0",
+          "hidden shrink-0 flex-col border-l border-border bg-sidebar lg:flex",
+          ctxPanel.collapsed && "w-0 overflow-hidden border-l-0",
         )}
+        style={ctxPanel.collapsed ? undefined : { width: ctxPanel.width }}
       >
-        <div className="flex h-16 shrink-0 items-center justify-between border-b border-sidebar-border px-4">
-          <div className="flex flex-col leading-tight">
-            <span className="text-sm font-semibold">Контекст</span>
-            <span className="text-xs text-muted-foreground">
-              {activeConv
-                ? `${activeConv.sourceIds.length} источник${activeConv.sourceIds.length !== 1 ? "ов" : ""}`
-                : "Нет активной беседы"
-              }
-            </span>
-          </div>
-          <span suppressHydrationWarning className="rounded-full bg-primary/15 px-2 py-0.5 text-xs font-medium text-primary">
-            {selectedCount} selected
-          </span>
-        </div>
-        <div className="flex items-center justify-between px-4 py-2">
-          <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-            Files
-          </span>
+        <div className="flex h-16 shrink-0 items-center gap-1 border-b border-sidebar-border px-3">
           <button
             type="button"
-            className="text-xs text-muted-foreground hover:text-foreground"
-            onClick={() => setSelected(new Set())}
+            onClick={() => setPanelTab("context")}
+            className={cn(
+              "rounded-md px-2.5 py-1.5 text-sm font-medium transition-colors",
+              panelTab === "context"
+                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                : "text-muted-foreground hover:text-foreground",
+            )}
           >
-            Clear
+            Контекст
+          </button>
+          <button
+            type="button"
+            onClick={() => setPanelTab("artifacts")}
+            className={cn(
+              "rounded-md px-2.5 py-1.5 text-sm font-medium transition-colors",
+              panelTab === "artifacts"
+                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+            title="Результаты работы агента: план, артефакты, журнал — чтобы не засорять чат"
+          >
+            Артефакты
+          </button>
+          {panelTab === "context" ? (
+            <span
+              suppressHydrationWarning
+              className="ml-auto rounded-full bg-primary/15 px-2 py-0.5 text-xs font-medium text-primary"
+            >
+              {selectedCount} selected
+            </span>
+          ) : (
+            <span className="ml-auto" />
+          )}
+          <button
+            type="button"
+            onClick={() => ctxPanel.setCollapsed(true)}
+            className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground"
+            title="Свернуть панель"
+          >
+            <PanelRightClose className="size-4" />
           </button>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-4">
-          {fileTreeData.length > 0 ? (
-            <FileTree tree={fileTreeData} selected={selected} onChange={setSelected} />
-          ) : (
-            <p className="px-2 py-4 text-xs text-muted-foreground">
-              {activeConv
-                ? "Привяжите источники через кнопку в шапке чата"
-                : "Выберите или создайте беседу"
-              }
-            </p>
-          )}
-        </div>
+
+        {panelTab === "context" ? (
+          <>
+            <div className="flex items-center justify-between gap-2 px-4 py-2">
+              <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                Files
+              </span>
+              <span className="truncate text-[11px] text-muted-foreground">
+                {activeConv
+                  ? `${activeConv.sourceIds.length} источник${activeConv.sourceIds.length !== 1 ? "ов" : ""}`
+                  : "Нет активной беседы"
+                }
+              </span>
+              <button
+                type="button"
+                className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => setSelected(new Set())}
+              >
+                Clear
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-4">
+              {fileTreeData.length > 0 ? (
+                <FileTree tree={fileTreeData} selected={selected} onChange={setSelected} />
+              ) : (
+                <p className="px-2 py-4 text-xs text-muted-foreground">
+                  {activeConv
+                    ? "Привяжите источники через кнопку в шапке чата"
+                    : "Выберите или создайте беседу"
+                  }
+                </p>
+              )}
+            </div>
+          </>
+        ) : (
+          <ArtifactsPanel conversationId={activeConvId} />
+        )}
       </aside>
     </div>
   )

@@ -175,6 +175,19 @@ def ensure_web_sessions_table() -> None:
     models.WebSession.__table__.create(bind=engine, checkfirst=True)
 
 
+def ensure_artifacts_tables() -> None:
+    """
+    Создаёт таблицы артефактов и журнала прогонов, если их ещё нет.
+
+    Тот же принцип, что у остальных новых таблиц: `create_all` в проекте никто не зовёт,
+    поэтому таблица обязана создавать себя сама — иначе фича молча деградирует.
+    """
+    from database import engine
+
+    models.Artifact.__table__.create(bind=engine, checkfirst=True)
+    models.RunJournal.__table__.create(bind=engine, checkfirst=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle: при старте — инициализируем LLMManager, Telegram bot info/webhook, при остановке — shutdown."""
@@ -197,6 +210,8 @@ async def lifespan(app: FastAPI):
     ensure_action_requests_nullable_source()
     # Реестр сессий: без таблицы поллер не сможет предупреждать об истечении
     ensure_web_sessions_table()
+    # Артефакты и журнал прогонов: история работы системы (решение 02.10)
+    ensure_artifacts_tables()
     await llm_manager.initialize()
     # Запускаем фоновую очистку сессий и поллер статусов HITL
     asyncio.create_task(hitl_monitor_loop())
@@ -2292,3 +2307,87 @@ def update_user_role(user_id: int, role: str, db: Session = Depends(get_db), cur
     
     audit.log_action(db, current_user.id, "web_ui", "edit_role", str(user_id), f"{old_role} -> {role}", "success")
     return {"status": "ok"}
+
+
+# ── АРТЕФАКТЫ И ЖУРНАЛ ПРОГОНОВ ─────────────────────────────────────────────
+# Владелец артефакта — ЗАДАЧА (решение 02.10.2026). План берётся живым из `agent_subtasks`
+# (не дублируется), файлы отдаются стримом, инлайн-текст — как есть. Весь блок под
+# `require_admin`, как и остальной периметр данных; прокси Next пробрасывают cookie.
+
+from fastapi.responses import FileResponse, RedirectResponse  # noqa: E402
+
+from services import artifacts as artifacts_service  # noqa: E402
+
+
+@app.get("/conversations/{conv_id}/runs", dependencies=[Depends(require_admin)])
+def list_conversation_runs(conv_id: str, limit: int = 50, db: Session = Depends(get_db)):
+    """История прогонов беседы: задача + счётчики + краткий журнал (свежие сверху)."""
+    return artifacts_service.runs_for_conversation(db, conv_id, limit=limit)
+
+
+@app.get("/tasks/{task_id}/artifacts", dependencies=[Depends(require_admin)])
+def get_task_artifacts(task_id: str, db: Session = Depends(get_db)):
+    """Карточка прогона: план (живой), артефакты, журнал."""
+    card = artifacts_service.list_for_task(db, task_id)
+    if card is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return card
+
+
+@app.post("/artifacts", dependencies=[Depends(require_admin)])
+async def publish_artifact(request: Request, db: Session = Depends(get_db)):
+    """Публикация артефакта извне (текст/ссылка). Файлы пойдут через `services.artifacts.save_file`."""
+    body = await request.json()
+    try:
+        row = artifacts_service.publish(
+            db,
+            task_id=body.get("task_id", ""),
+            kind=body.get("kind", "text"),
+            title=body.get("title") or "Артефакт",
+            content=body.get("content"),
+            url=body.get("url"),
+            mime=body.get("mime"),
+            origin=body.get("origin") or "agent",
+            meta=body.get("meta"),
+            ref_type=body.get("ref_type"),
+            ref_id=body.get("ref_id"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"id": row.id, "kind": row.kind, "title": row.title, "storage": row.storage}
+
+
+@app.get("/artifacts/{artifact_id}/content", dependencies=[Depends(require_admin)])
+def get_artifact_content(artifact_id: str, db: Session = Depends(get_db)):
+    """Содержимое артефакта: инлайн-текст, файл стримом или редирект на внешний URL."""
+    row = db.query(models.Artifact).filter(models.Artifact.id == artifact_id).first()
+    if row is None or row.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    if row.storage == "url" and row.url:
+        return RedirectResponse(row.url, status_code=302)
+
+    if row.storage == "disk":
+        try:
+            path = artifacts_service.safe_disk_path(row)
+        except ValueError as e:
+            # Именно 400, а не 500: битый path — это отказ в доступе, а не сбой сервера
+            raise HTTPException(status_code=400, detail=str(e))
+        return FileResponse(path, media_type=row.mime or "application/octet-stream", filename=row.title)
+
+    return Response(content=row.content or "", media_type=row.mime or "text/plain; charset=utf-8")
+
+
+@app.delete("/artifacts/{artifact_id}", dependencies=[Depends(require_admin)])
+def delete_artifact(artifact_id: str, db: Session = Depends(get_db)):
+    """
+    Мягкое удаление: карточка исчезает из UI, запись и файл остаются.
+
+    История работы — то, ради чего артефакты и заводились, поэтому стирать её молча нельзя.
+    """
+    row = db.query(models.Artifact).filter(models.Artifact.id == artifact_id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    row.deleted_at = datetime.utcnow()
+    db.commit()
+    return {"status": "deleted", "id": artifact_id}

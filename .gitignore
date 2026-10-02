@@ -22,3 +22,9 @@ chroma_data/
 *.sqlite3
 *.pyc
 tsconfig.tsbuildinfo
+
+# Файловые артефакты прогонов (создаются контейнером, живут на хосте через bind-mount).
+# Слэш в начале обязателен: без него паттерн глушит ЛЮБУЮ папку artifacts —
+# так под игнор попал маршрут приложения app/api/artifacts (поймано при git add).
+/artifacts/
+backend/venv/

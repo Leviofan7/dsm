@@ -3,9 +3,10 @@
 import Link from "next/link"
 import { usePathname } from "next/navigation"
 import type { ReactNode } from "react"
-import { Boxes, BarChart2, Database, MessagesSquare, Settings, Sparkles, Bot, Shield } from "lucide-react"
+import { Boxes, BarChart2, Database, MessagesSquare, Settings, Sparkles, Bot, Shield, ChevronsLeft, ChevronsRight } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
+import { ResizeHandle, useResizablePanel } from "@/components/ui/panel"
 
 const nav = [
   { href: "/", label: "Data Sources", icon: Database },
@@ -24,18 +25,47 @@ export function AppShell({
   contentClassName?: string
 }) {
   const pathname = usePathname()
+  // Ширина и свёрнутость навигации помнятся между запусками (см. components/ui/panel.tsx)
+  const rail = useResizablePanel("contextus_nav", { initial: 240, min: 176, max: 400 })
 
   return (
     <div className="flex h-dvh w-full overflow-hidden bg-background text-foreground">
-      <aside className="hidden w-60 shrink-0 flex-col border-r border-border bg-sidebar md:flex">
-        <div className="flex h-16 items-center gap-2.5 border-b border-sidebar-border px-5">
+      {rail.collapsed && (
+        <aside className="hidden w-12 shrink-0 flex-col items-center border-r border-border bg-sidebar py-4 md:flex">
+          <button
+            type="button"
+            onClick={() => rail.setCollapsed(false)}
+            className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground"
+            title="Показать навигацию"
+          >
+            <ChevronsRight className="size-4" />
+          </button>
+        </aside>
+      )}
+
+      <aside
+        className={cn(
+          "hidden w-60 shrink-0 flex-col border-r border-border bg-sidebar md:flex",
+          rail.collapsed && "md:hidden",
+        )}
+        style={rail.collapsed ? undefined : { width: rail.width }}
+      >
+        <div className="flex h-16 items-center gap-2.5 border-b border-sidebar-border px-4">
           <div className="flex size-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
             <Boxes className="size-5" />
           </div>
-          <div className="flex flex-col leading-tight">
+          <div className="flex min-w-0 flex-1 flex-col leading-tight">
             <span className="text-sm font-semibold">Contextus</span>
-            <span className="text-xs text-muted-foreground">RAG Console</span>
+            <span className="truncate text-xs text-muted-foreground">RAG Console</span>
           </div>
+          <button
+            type="button"
+            onClick={() => rail.setCollapsed(true)}
+            className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground"
+            title="Свернуть навигацию"
+          >
+            <ChevronsLeft className="size-4" />
+          </button>
         </div>
 
         <nav className="flex-1 space-y-1 p-3">
@@ -89,6 +119,15 @@ export function AppShell({
           </div>
         </div>
       </aside>
+
+      {!rail.collapsed && (
+        <ResizeHandle
+          panel="left"
+          className="hidden md:block"
+          onResize={rail.resize}
+          onReset={rail.reset}
+        />
+      )}
 
       <main className={cn("flex min-w-0 flex-1 flex-col overflow-hidden", contentClassName)}>
         {children}

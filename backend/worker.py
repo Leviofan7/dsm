@@ -65,6 +65,8 @@ async def run_agent_task(ctx, task_id: str, query: str, chat_id: int, history: l
         # 2. Выполняем стрим. Воркер перехватывает yield и пишет в БД/Redis.
         import redis.asyncio as aioredis
         import json
+
+        from services import artifacts as artifacts_service
         
         redis_pubsub = aioredis.from_url(redis_url)
         seq = 0
@@ -136,6 +138,20 @@ async def run_agent_task(ctx, task_id: str, query: str, chat_id: int, history: l
             db.add(task_event)
             db.commit()
             await redis_pubsub.publish(f"task:{task_id}", completion_event)
+
+            # Журнал прогона — то, «что система знает о себе»: агрегат для meta-analyst
+            # (паттерны неудач/удач) и для панели артефактов.
+            artifacts_service.upsert_journal(
+                db,
+                task_id,
+                status="success",
+                metrics={
+                    "events": seq,
+                    "duration_ms": int((datetime.utcnow() - task.created_at).total_seconds() * 1000)
+                    if task.created_at else None,
+                },
+                achievements=["прогон завершён без ошибок"],
+            )
             
         db.close()
         await redis_pubsub.close()
@@ -148,6 +164,10 @@ async def run_agent_task(ctx, task_id: str, query: str, chat_id: int, history: l
         if task:
             task.status = "cancelled"
             db.commit()
+            # Отмена — тоже исход: без строки в журнале прогон «исчезает» из истории
+            artifacts_service.upsert_journal(
+                db, task_id, status="cancelled", summary="прогон отменён (cancel/перезапуск сервиса)"
+            )
         db.close()
         raise
     except Exception as e:
@@ -157,6 +177,14 @@ async def run_agent_task(ctx, task_id: str, query: str, chat_id: int, history: l
         if task:
             task.status = "failed"
             db.commit()
+            # Ошибка обязана остаться в истории: раньше она жила только в логе контейнера,
+            # который стирается при пересоздании (инцидент 26.09 — «запрос испарился»).
+            artifacts_service.upsert_journal(
+                db,
+                task_id,
+                status="failed",
+                errors=[f"{type(e).__name__}: {e}"],
+            )
         db.close()
 
 from arq import cron

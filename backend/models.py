@@ -345,3 +345,60 @@ class AuditLog(Base):
     detail = Column(Text, nullable=True)             # JSON: diff, args, reason
     result = Column(String(20), nullable=False)      # "success" | "denied"
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Artifact(Base):
+    """
+    Материальный результат прогона (задачи): план, файл, картинка, текст, отчёт, ссылка.
+
+    Владелец артефакта — ЗАДАЧА (`agent_tasks`), а не беседа: история того, что система делала
+    и какие результаты получила, должна переживать удаление беседы (решение 02.10.2026).
+    Файлы лежат на диске (`<PROJECT_ROOT>/artifacts/<task_id>/`), в БД — только метаданные
+    и sha256 (дедуп).
+    """
+
+    __tablename__ = "artifacts"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    task_id = Column(String(36), ForeignKey("agent_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    conversation_id = Column(String(36), ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True, index=True)
+    kind = Column(String(20), nullable=False)        # plan | file | image | text | report | link | error_dump
+    title = Column(String(255), nullable=False, default="Артефакт")
+    mime = Column(String(120), nullable=True)
+    size_bytes = Column(Integer, nullable=True)
+    storage = Column(String(10), nullable=False, default="db")   # db | disk | url
+    content = Column(Text, nullable=True)            # storage=db: инлайн-текст
+    path = Column(String(1024), nullable=True)       # storage=disk: путь ОТНОСИТЕЛЬНО корня артефактов
+    url = Column(String(2048), nullable=True)        # storage=url: внешняя ссылка
+    sha256 = Column(String(64), nullable=True, index=True)
+    origin = Column(String(16), nullable=False, default="agent")  # agent | system | user
+    meta = Column(Text, nullable=True)               # JSON: произвольные поля (модель, шаг, страница…)
+    ref_type = Column(String(32), nullable=True)     # задел на привязки: intent | scenario | subtask …
+    ref_id = Column(String(128), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    deleted_at = Column(DateTime, nullable=True)     # мягкое удаление: история не стирается
+
+
+class RunJournal(Base):
+    """
+    Исход прогона в виде, пригодном для самоанализа: что делали, что не вышло, что получилось.
+
+    Это то, «что система знает о себе»: по журналу meta-analyst ищет паттерны неудач и удач,
+    а удачный прогон может быть предложен как сценарий (`scenario_proposed_id`).
+    """
+
+    __tablename__ = "run_journal"
+
+    task_id = Column(String(36), ForeignKey("agent_tasks.id", ondelete="CASCADE"), primary_key=True)
+    status = Column(String(20), nullable=False, default="success")   # success | partial | failed | cancelled
+    summary = Column(Text, nullable=True)
+    errors = Column(Text, nullable=True)             # JSON-список
+    achievements = Column(Text, nullable=True)       # JSON-список
+    metrics = Column(Text, nullable=True)            # JSON: длительность, шаги, тул-коллы, модели
+    self_review = Column(Text, nullable=True)        # оценка от meta_analyst
+    scenario_proposed_id = Column(
+        String(36), ForeignKey("scenario_definitions.id", ondelete="SET NULL"), nullable=True
+    )
+    tags = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
