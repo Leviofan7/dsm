@@ -825,7 +825,28 @@ async def process_telegram_message(chat_id: int, text: str):
 
     # 3. Полный инференс через LLMManager.execute() с tool calling
     user_obj, conv_obj = get_or_create_tg_user_and_conversation(chat_id)
-    
+
+    # Прогон обязан иметь владельца. Раньше Telegram шёл мимо задач: артефакт из TG
+    # публиковать было некуда (MCP-публикация отказывает «без id прогона»), а журнал
+    # собрать не из чего — путь Telegram целиком выпадал из истории и самоанализа.
+    # Создаём задачу так же, как веб-путь в /agent/run, и передаём её id в execute().
+    from services import artifacts as _artifacts
+
+    task_id = str(uuid.uuid4())
+    db = SessionLocal()
+    try:
+        db.add(models.AgentTask(
+            id=task_id,
+            owner_id=str(chat_id),
+            status="running",
+            task_type=task_type,
+            query=text,
+            conversation_id=conv_obj.id,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
     db = SessionLocal()
     try:
         # Load history from DB
@@ -839,13 +860,31 @@ async def process_telegram_message(chat_id: int, text: str):
     finally:
         db.close()
     
-    answer = await llm_manager.execute(
-        query=text,
-        task_type=task_type,
-        system_prompt=system_prompt,
-        history=history,
-        chat_id=chat_id,
-    )
+    try:
+        answer = await llm_manager.execute(
+            query=text,
+            task_type=task_type,
+            system_prompt=system_prompt,
+            history=history,
+            chat_id=chat_id,
+            task_id=task_id,
+        )
+    except Exception as e:
+        # Падение тоже обязано остаться в истории: иначе прогон «исчезает», а задача
+        # висит в running навсегда (ровно то, на что жаловались по веб-пути).
+        db = SessionLocal()
+        try:
+            task = db.query(models.AgentTask).filter(models.AgentTask.id == task_id).first()
+            if task:
+                task.status = "failed"
+                db.commit()
+            _artifacts.finalize_journal(
+                db, task_id, status="failed", errors=[f"{type(e).__name__}: {e}"]
+            )
+        finally:
+            db.close()
+        raise
+
     tg_logger.info(f"✅ Ответ ({len(answer)} символов): {answer[:120]}…")
     
     db = SessionLocal()
@@ -853,7 +892,12 @@ async def process_telegram_message(chat_id: int, text: str):
         # Save assistant message
         assistant_msg = models.Message(conversation_id=conv_obj.id, role="assistant", content=answer)
         db.add(assistant_msg)
+        task = db.query(models.AgentTask).filter(models.AgentTask.id == task_id).first()
+        if task:
+            task.status = "completed"
         db.commit()
+        # Итог прогона — та же сводка (метрики/ошибки/достижения), что и у веб-пути.
+        _artifacts.finalize_journal(db, task_id, status="success")
     finally:
         db.close()
     

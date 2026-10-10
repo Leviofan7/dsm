@@ -1662,6 +1662,7 @@ class LLMManager:
         history: list[dict] | None = None,
         max_tool_rounds: int = 15,
         chat_id: int | None = None,
+        task_id: str | None = None,
     ) -> str:
         """
         Полный цикл инференса с поддержкой HITL (Human-in-the-Loop) и Supervisor:
@@ -1672,6 +1673,10 @@ class LLMManager:
         Модели берутся через общий резолвер (resolve_agent_decision → настройки агента
         из config/agent_configs.json). Раньше здесь стоял registry.resolve_model(task_type),
         то есть Telegram-путь шёл мимо настроек агентов и резолвера режима.
+
+        `task_id` — владелец прогона. Без него (старый Telegram-путь) артефакты не к чему
+        привязать, а трейсы не попадают в метрики журнала: прогон «есть», а истории нет.
+        Поэтому вызывающий обязан передать id задачи, которую сам же и создал.
         """
         model, conf, mode, reason = resolve_agent_decision(self.registry, task_type, "auto", query=query)
         if not model:
@@ -1781,14 +1786,14 @@ class LLMManager:
                         if session:
                             session.complete()
                             session_manager.remove_session(chat_id)
-                        self._record_trace(session, chat_id, task_type, task_type, model, tools, tools_called, tools_called_names, t_start, "failure")
+                        self._record_trace(session, chat_id, task_type, task_type, model, tools, tools_called, tools_called_names, t_start, "failure", task_id=task_id)
                         return "Ошибка: все модели недоступны."
 
                 else:
                     if session:
                         session.complete()
                         session_manager.remove_session(chat_id)
-                    self._record_trace(session, chat_id, task_type, task_type, model, tools, tools_called, tools_called_names, t_start, "failure", tool_verified, tool_verification_details)
+                    self._record_trace(session, chat_id, task_type, task_type, model, tools, tools_called, tools_called_names, t_start, "failure", tool_verified, tool_verification_details, task_id=task_id)
                     return "Ошибка: модель не ответила и нет fallback."
 
             # Проверяем: есть ли tool_calls?
@@ -1834,7 +1839,7 @@ class LLMManager:
                     if session:
                         session.complete()
                         session_manager.remove_session(chat_id)
-                    self._record_trace(session, chat_id, task_type, task_type, model, tools, tools_called, tools_called_names, t_start, "success", tool_verified, tool_verification_details)
+                    self._record_trace(session, chat_id, task_type, task_type, model, tools, tools_called, tools_called_names, t_start, "success", tool_verified, tool_verification_details, task_id=task_id)
                     return final_answer
                 # ── Конец Контролёра ───────────────────────────────────
 
@@ -1844,7 +1849,7 @@ class LLMManager:
                     session.complete()
                     session_manager.remove_session(chat_id)
                 final_status = "stub_response" if self._detect_stub(final_answer) else "success"
-                self._record_trace(session, chat_id, task_type, task_type, model, tools, tools_called, tools_called_names, t_start, final_status, tool_verified, tool_verification_details)
+                self._record_trace(session, chat_id, task_type, task_type, model, tools, tools_called, tools_called_names, t_start, final_status, tool_verified, tool_verification_details, task_id=task_id)
                 return final_answer
 
             # Выполняем каждый tool_call через MCP
@@ -1890,7 +1895,7 @@ class LLMManager:
                     messages.append(self._build_tool_result_msg(model, tool_id, tool_name, blocked_text))
                     continue
 
-                result_text = await self._call_tool(tool_name, tool_args, task_type)
+                result_text = await self._call_tool(tool_name, tool_args, task_type, task_id)
                 
                 # --- HITL Request (если инструмент сам попросил) ---
                 if "__hitl_request__" in result_text and session:
@@ -1935,7 +1940,7 @@ class LLMManager:
             session_manager.remove_session(chat_id)
         final_answer = self._extract_text(model, response) if response else "Превышен лимит раундов tool calling."
         final_status = "stub_response" if self._detect_stub(final_answer) else ("timeout" if not response else "success")
-        self._record_trace(session, chat_id, task_type, task_type, model, tools, tools_called, tools_called_names, t_start, final_status, tool_verified, tool_verification_details)
+        self._record_trace(session, chat_id, task_type, task_type, model, tools, tools_called, tools_called_names, t_start, final_status, tool_verified, tool_verification_details, task_id=task_id)
         
         if final_status in ("timeout", "failure") or tools_called >= max_tool_rounds:
             if self._should_trigger_analyst(task_type):
