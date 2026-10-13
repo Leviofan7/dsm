@@ -163,9 +163,13 @@ async def run_agent_task(ctx, task_id: str, query: str, chat_id: int, history: l
         raise
     except Exception as e:
         logger.error(f"Внутренняя ошибка воркера для задачи {task_id}: {str(e)}")
+        failed_task_type = None
         db = SessionLocal()
         task = db.query(AgentTask).filter(AgentTask.id == task_id).first()
         if task:
+            # task_type читаем ДО commit: после него атрибуты истекают (expire_on_commit),
+            # а объект после db.close() уже detached — доступ к полю дал бы DetachedInstanceError.
+            failed_task_type = task.task_type
             task.status = "failed"
             db.commit()
             # Ошибка обязана остаться в истории: раньше она жила только в логе контейнера,
@@ -177,6 +181,18 @@ async def run_agent_task(ctx, task_id: str, query: str, chat_id: int, history: l
                 errors=[f"{type(e).__name__}: {e}"],
             )
         db.close()
+
+        # LLM-ревизия упавшего прогона — сохраняется в журнал (`self_review.llm_review`).
+        # Раньше аналитик вызывался только из Telegram-пути и результат выбрасывался.
+        # Трейсы web-прогона пишутся с `session_id == task_id` (см. execute_stream),
+        # поэтому ревизор читает этот прогон по task_id. Кулдаун и фон — как в execute().
+        try:
+            tt = failed_task_type or "unknown"
+            if llm_manager._should_trigger_analyst(tt):
+                llm_manager._mark_analyst_run(tt)
+                await llm_manager._analyst_and_store(session_id=task_id, task_id=task_id)
+        except Exception as analyst_err:  # noqa: BLE001 — фон не имеет права уронить воркер
+            logger.error(f"Meta-Analyst (worker) не отработал для {task_id}: {analyst_err}")
 
 from arq import cron
 from datetime import datetime, timedelta

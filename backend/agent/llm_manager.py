@@ -1946,7 +1946,9 @@ class LLMManager:
             if self._should_trigger_analyst(task_type):
                 self._mark_analyst_run(task_type)
                 if session:
-                    asyncio.create_task(self.run_meta_analyst(session.session_id))
+                    # Ревизия СОХРАНЯЕТСЯ в журнал прогона: раньше результат create_task
+                    # выбрасывался — работа (и деньги) уходили в никуда.
+                    asyncio.create_task(self._analyst_and_store(session.session_id, task_id))
         
         return final_answer
 
@@ -2120,6 +2122,31 @@ class LLMManager:
         from agent.roles_impl.analyst import AnalystAgent
         agent = AnalystAgent(self)
         return await agent.run(session_id)
+
+    async def _analyst_and_store(self, session_id: str | None, task_id: str | None) -> None:
+        """
+        Гоняет LLM-ревизию и СОХРАНЯЕТ её в журнал прогона (`self_review.llm_review`).
+
+        Раньше результат `run_meta_analyst` терялся: его запускали через create_task и
+        никуда не писали — ревизия стоила денег и исчезала. Детерминированные блоки
+        самоанализа при этом не подменяются (см. services/review.py). Любая ошибка
+        аналитика глушится: фоновая ревизия не имеет права ломать прогон.
+        """
+        try:
+            report = await self.run_meta_analyst(session_id) if session_id else ""
+        except Exception as e:  # noqa: BLE001 — фон: падение аналитика не должно всплывать
+            report = f"Ошибка Meta-Analyst: {type(e).__name__}: {e}"
+        if not task_id or not report:
+            return
+        from services import review as review_service
+
+        db = SessionLocal()
+        try:
+            review_service.attach_llm_review(db, task_id, report)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Не удалось сохранить LLM-ревизию для {task_id}: {e}")
+        finally:
+            db.close()
 
     def _detect_stub(self, text: str) -> bool:
         if not text:

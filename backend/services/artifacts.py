@@ -28,6 +28,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from models import AgentSubtask, AgentTask, Artifact, ExecutionTrace, RunJournal
+from services import review as review_service
 
 #: Закрытый список типов: UI рассчитывает на превью для каждого из них.
 KINDS = ("plan", "file", "image", "text", "report", "link", "error_dump")
@@ -268,7 +269,8 @@ def journal_card(j: RunJournal) -> dict[str, Any]:
         "errors": load(j.errors),
         "achievements": load(j.achievements),
         "metrics": load(j.metrics),
-        "self_review": j.self_review,
+        # Самоанализ отдаём разобранным: детерминированные блоки + llm_review внутри.
+        "self_review": review_service.parse_self_review(j.self_review),
         "scenario_proposed_id": j.scenario_proposed_id,
         "tags": j.tags,
         "updated_at": j.updated_at.isoformat() if j.updated_at else None,
@@ -517,6 +519,14 @@ def finalize_journal(
         # Сводка по фактам, а не «всё хорошо»: план и то, что осталось в результате.
         summary = "; ".join(achievements)
 
+    # Самоанализ: детерминированные блоки (класс проблемы, инструменты, подсказки) плюс
+    # сохранение уже прикреплённой LLM-ревизии. До этого поле `self_review` не заполнял
+    # никто — журнал был набором фактов без интерпретации.
+    review = review_service.build_self_review(
+        db, task_id, status=status, summary=summary, errors=merged or None, metrics=metrics
+    )
+    review = review_service.preserve_llm_review(db, task_id, review)
+
     return upsert_journal(
         db,
         task_id,
@@ -525,7 +535,7 @@ def finalize_journal(
         errors=merged or None,
         achievements=achievements or None,
         metrics=metrics or None,
-        self_review=self_review,
+        self_review=self_review if self_review is not None else json.dumps(review, ensure_ascii=False),
         tags=tags,
     )
 
@@ -551,6 +561,8 @@ def journal_patterns(db: Session, limit: int = 100) -> dict[str, Any]:
     by_status: dict[str, int] = {}
     durations: list[int] = []
     signatures: dict[str, dict[str, Any]] = {}
+    failure_modes: dict[str, int] = {}
+    hints: dict[str, int] = {}
 
     for row in rows:
         by_status[row.status] = by_status.get(row.status, 0) + 1
@@ -572,6 +584,14 @@ def journal_patterns(db: Session, limit: int = 100) -> dict[str, Any]:
             entry = signatures.setdefault(key, {"count": 0, "sample": str(err)[:200]})
             entry["count"] += 1
 
+        # Мета-анализ по сериям: классы проблем и подсказки из самоанализа прогонов.
+        review = review_service.parse_self_review(row.self_review) or {}
+        mode = review.get("failure_mode")
+        if mode:
+            failure_modes[mode] = failure_modes.get(mode, 0) + 1
+        for hint in review.get("improvement_hints") or []:
+            hints[str(hint)] = hints.get(str(hint), 0) + 1
+
     total = len(rows)
     success = by_status.get("success", 0)
     return {
@@ -579,5 +599,11 @@ def journal_patterns(db: Session, limit: int = 100) -> dict[str, Any]:
         "by_status": by_status,
         "success_rate": round(success / total, 3) if total else None,
         "avg_duration_ms": int(sum(durations) / len(durations)) if durations else None,
+        "by_failure_mode": dict(sorted(failure_modes.items(), key=lambda kv: kv[1], reverse=True)),
+        "top_hints": sorted(
+            ({"hint": h, "count": c} for h, c in hints.items()),
+            key=lambda e: e["count"],
+            reverse=True,
+        )[:5],
         "top_errors": sorted(signatures.values(), key=lambda e: e["count"], reverse=True)[:5],
     }
