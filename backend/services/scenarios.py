@@ -336,8 +336,20 @@ def propose_from_run(
     return scenario, True
 
 
-def scenario_card(scenario: ScenarioDefinition, *, created: bool = False) -> dict[str, Any]:
-    """Карточка предложения для API/UI. `needs_args` — честная пометка, что нужен человек."""
+def scenario_card(
+    scenario: ScenarioDefinition,
+    *,
+    created: bool = False,
+    tool_schemas: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """
+    Карточка предложения для API/UI. `needs_args` — честная пометка, что нужен человек.
+
+    `tool_schemas` (из живого реестра MCP) добавляет к каждому шагу `required`/`properties`:
+    редактор аргументов должен показывать, ЧТО заполнять, а не заставлять человека угадывать
+    и ловить 422. Схем нет — списки пустые, и это видно (`schema_checked`), а не выглядит
+    как «обязательных полей нет».
+    """
     try:
         steps = json.loads(scenario.steps or "[]")
     except Exception:
@@ -352,12 +364,15 @@ def scenario_card(scenario: ScenarioDefinition, *, created: bool = False) -> dic
         "status": scenario.status,
         "steps": len(steps),
         "tools": [s.get("tool") for s in steps],
+        "schema_checked": tool_schemas is not None,
         # Детали шагов — для редактора аргументов: без них человек не видит, что заполнять.
         "steps_detail": [
             {
                 "tool": s.get("tool"),
                 "description": s.get("description"),
                 "args_template": s.get("args_template") or {},
+                "required": _schema_required((tool_schemas or {}).get(s.get("tool"))),
+                "properties": sorted(_schema_properties((tool_schemas or {}).get(s.get("tool"))).keys()),
             }
             for s in steps
         ],

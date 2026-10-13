@@ -10,11 +10,12 @@ import {
   FileText,
   Loader2,
   RefreshCw,
-  Sparkles,
   Trash2,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
+import { SelfReviewCard, type SelfReview } from "./self-review-card"
+import { ScenarioSection } from "./scenario-editor"
 
 /**
  * Вкладка «Артефакты»: история прогонов беседы и всё, что агент произвёл.
@@ -67,6 +68,8 @@ type RunCard = {
     errors: string[] | null
     achievements: string[] | null
     metrics: Record<string, any> | null
+    /** Разобранный самоанализ прогона (класс проблемы, подсказки, ревизия аналитика). */
+    self_review?: SelfReview | null
     updated_at: string | null
     scenario_proposed_id: string | null
   } | null
@@ -270,12 +273,15 @@ function RunDetail({ taskId, onToast }: { taskId: string; onToast?: (msg: string
         </section>
       )}
 
+      {/* Самоанализ — смысл прогона: класс проблемы, подсказки, ревизия аналитика */}
+      <SelfReviewCard review={card.journal?.self_review} />
+
       {(card.journal?.status === "success" || card.task.status === "completed") && (
         <section>
           <h4 className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
             Сценарий
           </h4>
-          <ProposeScenario taskId={taskId} proposed={card.journal?.scenario_proposed_id} />
+          <ScenarioSection taskId={taskId} proposed={card.journal?.scenario_proposed_id} />
         </section>
       )}
 
@@ -297,85 +303,22 @@ function RunDetail({ taskId, onToast }: { taskId: string; onToast?: (msg: string
   )
 }
 
-type ScenarioCard = {
-  id: string
-  status: string
-  steps: number
-  tools: (string | null)[]
-  needs_args: boolean
-  created: boolean
-  warning: string | null
-}
-
-/**
- * «Предложить сценарий» — заготовка из удачного прогона.
- *
- * Бэкенд честно отказывает (400 + причина), когда повторять нечего: прогон упал
- * или не вызывал инструментов. Причину показываем как есть, а не «что-то пошло не так».
- */
-function ProposeScenario({ taskId, proposed }: { taskId: string; proposed?: string | null }) {
-  const [busy, setBusy] = useState(false)
-  const [result, setResult] = useState<ScenarioCard | null>(null)
-  const [error, setError] = useState<string | null>(null)
-
-  const propose = async () => {
-    setBusy(true)
-    setError(null)
-    try {
-      const res = await fetch(`/api/tasks/${taskId}/scenario`, { method: "POST" })
-      const data = await res.json().catch(() => null)
-      if (!res.ok) {
-        setError(
-          typeof data?.detail === "string" ? data.detail : data?.error || `HTTP ${res.status}`,
-        )
-        return
-      }
-      setResult(data as ScenarioCard)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Не удалось предложить сценарий")
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return (
-    <div className="space-y-1">
-      <Button size="sm" variant="outline" onClick={propose} disabled={busy} className="h-7 text-[11px]">
-        {busy ? (
-          <Loader2 className="mr-1 size-3 animate-spin" />
-        ) : (
-          <Sparkles className="mr-1 size-3" />
-        )}
-        Предложить сценарий
-      </Button>
-      {proposed && !result && (
-        <p className="text-[11px] text-muted-foreground">Сценарий уже предложен ранее</p>
-      )}
-      {error && <p className="text-[11px] text-destructive">{error}</p>}
-      {result && (
-        <div className="rounded-md border border-border bg-background/60 p-2 text-[11px]">
-          <div className="font-medium">
-            {result.created ? "Черновик создан" : "Такой сценарий уже есть"}: {result.id.slice(0, 8)}…
-          </div>
-          <div className="text-muted-foreground">
-            шагов: {result.steps} · {result.tools.filter(Boolean).join(" → ")}
-          </div>
-          {result.warning && <p className="mt-1 text-amber-600">{result.warning}</p>}
-        </div>
-      )}
-    </div>
-  )
-}
-
 type Patterns = {
   window: number
   by_status: Record<string, number>
   success_rate: number | null
   avg_duration_ms: number | null
+  by_failure_mode?: Record<string, number>
+  top_hints?: { hint: string; count: number }[]
   top_errors: { count: number; sample: string }[]
 }
 
-/** Сводка по журналам: доля успеха и частые ошибки — это и есть самоанализ в минимуме. */
+/**
+ * Сводка по журналам: доля успеха, классы проблем, подсказки и частые ошибки.
+ *
+ * Это мета-анализ по СЕРИИ прогонов (`GET /journals/patterns`): по нему видно, где система
+ * спотыкается системно, а не разово.
+ */
 function PatternsBar() {
   const [data, setData] = useState<Patterns | null>(null)
   const [open, setOpen] = useState(false)
@@ -398,6 +341,10 @@ function PatternsBar() {
   if (!data || data.window === 0) return null
 
   const pct = data.success_rate === null ? "—" : `${Math.round(data.success_rate * 100)}%`
+  const hints = data.top_hints ?? []
+  const modes = Object.entries(data.by_failure_mode ?? {}).sort((a, b) => b[1] - a[1])
+  const hasDetails = hints.length > 0 || modes.length > 0 || data.top_errors.length > 0
+
   return (
     <div className="mx-2 mb-2 rounded-md border border-border bg-background/40 px-2 py-1.5 text-[11px]">
       <button
@@ -412,22 +359,52 @@ function PatternsBar() {
             · {Math.round(data.avg_duration_ms / 1000)} с в среднем
           </span>
         ) : null}
-        {data.top_errors.length > 0 ?
+        {hasDetails ? (
           open ? (
             <ChevronDown className="ml-auto size-3 shrink-0" />
           ) : (
             <ChevronRight className="ml-auto size-3 shrink-0" />
           )
-        : null}
+        ) : null}
       </button>
-      {open && data.top_errors.length > 0 && (
-        <ul className="mt-1 space-y-0.5 text-muted-foreground">
-          {data.top_errors.map((e, i) => (
-            <li key={i} className="truncate" title={e.sample}>
-              ×{e.count} — {e.sample}
-            </li>
-          ))}
-        </ul>
+      {open && (
+        <div className="mt-1 space-y-1.5 text-muted-foreground">
+          {hints.length > 0 && (
+            <div>
+              <span className="font-medium text-foreground">Что чинить чаще всего:</span>
+              <ul className="mt-0.5 space-y-0.5">
+                {hints.map((h, i) => (
+                  <li key={i} className="break-words">
+                    ×{h.count} — {h.hint}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {modes.length > 0 && (
+            <div>
+              <span className="font-medium text-foreground">Классы проблем: </span>
+              {modes.map(([m, c], i) => (
+                <span key={m}>
+                  {i > 0 ? " · " : ""}
+                  {m} ×{c}
+                </span>
+              ))}
+            </div>
+          )}
+          {data.top_errors.length > 0 && (
+            <div>
+              <span className="font-medium text-foreground">Частые ошибки:</span>
+              <ul className="mt-0.5 space-y-0.5">
+                {data.top_errors.map((e, i) => (
+                  <li key={i} className="truncate" title={e.sample}>
+                    ×{e.count} — {e.sample}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
       )}
     </div>
   )

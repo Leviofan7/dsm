@@ -1960,6 +1960,20 @@ def _validate_scenario_or_fail(steps: Any) -> dict:
     return report
 
 
+@app.get("/scenarios/{scenario_id}", dependencies=[Depends(require_admin)])
+async def get_scenario(scenario_id: str, db: Session = Depends(get_db)):
+    """
+    Карточка сценария: шаги, обязательные поля инструментов, причина предложения.
+
+    Нужна редактору аргументов: после перезагрузки страницы шаги надо откуда-то взять —
+    из ответа `POST /tasks/{id}/scenario` их уже не достать.
+    """
+    scenario = db.query(ScenarioDefinition).filter(ScenarioDefinition.id == scenario_id).first()
+    if not scenario:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    return scenarios_service.scenario_card(scenario, tool_schemas=_scenario_tool_schemas())
+
+
 @app.put("/scenarios/{scenario_id}/steps", dependencies=[Depends(require_admin)])
 async def update_scenario_steps(
     scenario_id: str,
@@ -1993,7 +2007,13 @@ async def update_scenario_steps(
     audit.log_action(
         db, current_user.id, "web_ui", "update_scenario_steps", scenario_id, scenario.name, "success"
     )
-    return {"status": "validated", "report": report, "scenario": scenarios_service.scenario_card(scenario)}
+    return {
+        "status": "validated",
+        "report": report,
+        "scenario": scenarios_service.scenario_card(
+            scenario, tool_schemas=_scenario_tool_schemas()
+        ),
+    }
 
 
 @app.post("/scenarios/{scenario_id}/activate", dependencies=[Depends(require_admin)])
@@ -2046,7 +2066,12 @@ async def activate_scenario(
     db.commit()
     import audit
     audit.log_action(db, current_user.id, "web_ui", "activate_scenario", scenario_id, scenario.name, "success")
-    return {"status": "activated", "report": report, "approved_hash": scenario.approved_hash}
+    return {
+        "status": "activated",
+        "report": report,
+        "approved_hash": scenario.approved_hash,
+        "scenario": scenarios_service.scenario_card(scenario, tool_schemas=_scenario_tool_schemas()),
+    }
 
 # ── Apprentice Mode ─────────────────────────────────────────────────
 
@@ -2608,4 +2633,6 @@ def propose_scenario_from_run(task_id: str, db: Session = Depends(get_db)):
     except ValueError as e:
         # Честный отказ вместо пустышки: неудачный прогон или прогон без вызовов инструментов
         raise HTTPException(status_code=400, detail=str(e))
-    return scenarios_service.scenario_card(scenario, created=created)
+    return scenarios_service.scenario_card(
+        scenario, created=created, tool_schemas=_scenario_tool_schemas()
+    )

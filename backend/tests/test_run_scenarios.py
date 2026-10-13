@@ -335,6 +335,54 @@ def test_activation_locks_steps_with_executor_hash(client, monkeypatch):
     assert json.loads(steps)[0]["args_template"]["query"] == "{{query}}"
 
 
+def test_scenario_card_exposes_required_fields_from_schema():
+    """Редактор аргументов должен видеть, ЧТО заполнять, а не угадывать и ловить 422."""
+    db = TestingSessionLocal()
+    task_id = _seed_run(db)
+    scenario, _ = scenarios_service.propose_from_run(db, task_id)
+    card = scenarios_service.scenario_card(scenario, tool_schemas=_TOOL_SCHEMAS)
+    db.close()
+
+    assert card["schema_checked"] is True
+    by_tool = {s["tool"]: s for s in card["steps_detail"]}
+    assert by_tool["web_search"]["required"] == ["query"]
+    assert by_tool["goto_url"]["required"] == ["url"]
+    assert "url" in by_tool["goto_url"]["properties"]
+
+
+def test_scenario_card_without_schemas_is_honest():
+    """Схем нет (MCP не поднят) — списки пустые И `schema_checked=false`, а не «полей нет»."""
+    db = TestingSessionLocal()
+    task_id = _seed_run(db)
+    scenario, _ = scenarios_service.propose_from_run(db, task_id)
+    card = scenarios_service.scenario_card(scenario)
+    db.close()
+
+    assert card["schema_checked"] is False
+    assert all(s["required"] == [] for s in card["steps_detail"])
+
+
+def test_get_scenario_detail_endpoint(client, monkeypatch):
+    monkeypatch.setattr(main, "_scenario_tool_schemas", lambda: _TOOL_SCHEMAS)
+    db = TestingSessionLocal()
+    cookie = _admin_cookie(db)
+    task_id = _seed_run(db)
+    db.close()
+
+    sid = _propose(client, cookie, task_id)
+
+    resp = client.get(f"/scenarios/{sid}", cookies={"contextus_session": cookie})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["id"] == sid
+    assert body["schema_checked"] is True
+    assert body["steps_detail"][0]["required"] == ["query"], "шаги должны быть видны после reload"
+    assert body["proposal_reason"], "причина предложения обязана отдаваться"
+
+    missing = client.get("/scenarios/does-not-exist", cookies={"contextus_session": cookie})
+    assert missing.status_code == 404
+
+
 def test_proposal_reason_is_recorded():
     """Почему предложен сценарий — отдельное поле, а не текст в description."""
     db = TestingSessionLocal()
