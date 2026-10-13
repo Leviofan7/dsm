@@ -104,9 +104,158 @@ def _link_journal(db: Session, task_id: str, journal: RunJournal | None, scenari
     return journal
 
 
-def _steps_digest(steps: list[dict[str, Any]]) -> str:
+def steps_digest(steps: list[dict[str, Any]]) -> str:
+    """Канонический хэш набора шагов (sort_keys) — инвариант дедупа предложений."""
     canonical = json.dumps(steps, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def content_hash(steps_text: str | None) -> str:
+    """
+    sha256 по СЫРОМУ тексту `scenario.steps` — ровно то, что сверяет `LinearScenarioExecutor`
+    (`hashlib.sha256(scenario.steps.encode())`).
+
+    ВАЖНО, здесь легко ошибиться: у сценария ДВА разных хэша и они не взаимозаменяемы.
+    `steps_digest` канонический (sort_keys) — инвариант дедупа предложений; `content_hash`
+    raw-строковый — инвариант целостности при исполнении. Если записать в `approved_hash`
+    канонический хэш, исполнитель посчитает утверждённые шаги подменёнными и заблокирует
+    запуск. Держим оба в одном месте, чтобы связь была видна.
+    """
+    return hashlib.sha256((steps_text or "").encode("utf-8")).hexdigest()
+
+
+def _schema_properties(schema: dict[str, Any] | None) -> dict[str, Any]:
+    props = (schema or {}).get("properties")
+    return props if isinstance(props, dict) else {}
+
+
+def _schema_required(schema: dict[str, Any] | None) -> list[str]:
+    req = (schema or {}).get("required")
+    return [str(r) for r in req] if isinstance(req, list) else []
+
+
+def validate_scenario_steps(
+    steps: Any,
+    schemas: dict[str, dict[str, Any]] | None = None,
+    *,
+    require_args: bool = True,
+) -> dict[str, Any]:
+    """
+    Разбор шагов сценария ПЕРЕД сохранением/активацией. Возвращает отчёт, а не бросает:
+    вызывающий сам решает, 422 это или 403, и показывает человеку точный список проблем.
+
+    Почему отчёт, а не проверка в момент исполнения: сценарий с незаполненными аргументами
+    выглядит рабочим и запускается «молча» — инструменты получают пустые параметры и делают
+    что попало. Отказ обязан случиться до записи статуса `active`.
+
+    `schemas` — входные схемы инструментов из реестра MCP. Если `None` (MCP ещё не поднят),
+    проверяем только структуру и непустые аргументы, честно помечая в отчёте
+    `schema_checked=False`; делать вид, что сверили имена и обязательные поля, — враньё.
+    """
+    from agent.mcp_manager import PRIVILEGED_TOOLS  # локально: сервис не тянет MCP при импорте
+
+    report: dict[str, Any] = {
+        "valid": True,
+        "schema_checked": schemas is not None,
+        "errors": [],
+        "empty_args": [],
+        "blank_values": {},
+        "missing_required": {},
+        "unknown_args": {},
+        "privileged_tools": [],
+    }
+
+    if not isinstance(steps, list) or not steps:
+        report["valid"] = False
+        report["errors"].append("steps должен быть непустым списком шагов")
+        return report
+
+    for idx, step in enumerate(steps):
+        pos = f"шаг {idx + 1}"
+        if not isinstance(step, dict):
+            report["errors"].append(f"{pos}: ожидался объект с полем tool")
+            continue
+
+        tool = str(step.get("tool") or "").strip()
+        if not tool:
+            report["errors"].append(f"{pos}: не указан tool")
+            continue
+        if tool in PRIVILEGED_TOOLS:
+            report["privileged_tools"].append(tool)
+            continue
+
+        args = step.get("args_template")
+        if args is None:
+            args = {}
+        if not isinstance(args, dict):
+            report["errors"].append(f"{pos} ({tool}): args_template должен быть объектом")
+            args = {}
+
+        if not args:
+            report["empty_args"].append(tool)
+
+        for key, value in args.items():
+            # Пустая строка — не «аргумент», а его отсутствие: инструмент получит ""
+            # и сделает бессмысленный вызов, который никто не заметит.
+            if isinstance(value, str) and not value.strip():
+                report["blank_values"].setdefault(tool, []).append(key)
+
+        if schemas is not None:
+            if tool not in schemas:
+                report["errors"].append(f"{pos} ({tool}): инструмент не зарегистрирован")
+                continue
+            schema = schemas.get(tool)
+            for req in _schema_required(schema):
+                if req not in args:
+                    report["missing_required"].setdefault(tool, []).append(req)
+            props = _schema_properties(schema)
+            # Строгость к лишним ключам — только когда схема реально описывает свойства
+            # и не разрешает дополнительные явно: иначе опечатка в имени аргумента
+            # («quier» вместо «query») молча уедет в инструмент.
+            if props and (schema or {}).get("additionalProperties") is not True:
+                unknown = [k for k in args if k not in props]
+                if unknown:
+                    report["unknown_args"].setdefault(tool, unknown)
+
+    if (
+        report["errors"]
+        or report["empty_args"]
+        or report["blank_values"]
+        or report["missing_required"]
+        or report["unknown_args"]
+        or report["privileged_tools"]
+    ):
+        report["valid"] = False
+    return report
+
+
+def validation_message(report: dict[str, Any]) -> str:
+    """Человекочитаемая причина отказа: что именно человеку надо заполнить."""
+    parts: list[str] = []
+    if report.get("privileged_tools"):
+        parts.append("привилегированные инструменты: " + ", ".join(report["privileged_tools"]))
+    if report.get("empty_args"):
+        parts.append("не заполнены аргументы: " + ", ".join(report["empty_args"]))
+    for tool, fields in (report.get("missing_required") or {}).items():
+        parts.append(f"{tool}: отсутствуют обязательные поля {', '.join(fields)}")
+    for tool, fields in (report.get("blank_values") or {}).items():
+        parts.append(f"{tool}: пустые значения {', '.join(fields)}")
+    for tool, fields in (report.get("unknown_args") or {}).items():
+        parts.append(f"{tool}: неизвестные аргументы {', '.join(fields)}")
+    parts.extend(report.get("errors") or [])
+    return "; ".join(parts) or "шаги не прошли валидацию"
+
+
+def _default_reason(task_id: str, status: str, tools: list[str], summary: str | None) -> str:
+    """Почему предложен сценарий — по фактам прогона, а не «система так решила»."""
+    chain = " → ".join(tools[:8]) + (" → …" if len(tools) > 8 else "")
+    reason = (
+        f"Прогон {task_id} завершился успешно (статус {status}); "
+        f"вызвано инструментов: {len(tools)} ({chain})"
+    )
+    if summary:
+        reason += f". Итог прогона: {summary[:200]}"
+    return reason
 
 
 def propose_from_run(
@@ -146,7 +295,11 @@ def propose_from_run(
         }
         for i, tool in enumerate(tools)
     ]
-    digest = _steps_digest(steps)
+    digest = steps_digest(steps)
+
+    query = (task.query or "прогон").strip()[:60]
+    summary = (journal.summary if journal and journal.summary else "").strip()
+    reason = _default_reason(task_id, status, tools, summary)
 
     existing = (
         db.query(ScenarioDefinition)
@@ -154,17 +307,21 @@ def propose_from_run(
         .first()
     )
     if existing is not None:
+        # Сценарий уже есть, но предложение из НОВОГО прогона — это ещё один факт
+        # происхождения: если причина не записана, фиксируем её (не перезаписываем).
+        if not existing.proposal_reason:
+            existing.proposal_reason = reason
+            db.commit()
         _link_journal(db, task_id, journal, existing.id)
         logger.info(f"📋 Сценарий уже есть по хэшу {digest[:8]} (id={existing.id})")
         return existing, False
 
-    query = (task.query or "прогон").strip()[:60]
-    summary = (journal.summary if journal and journal.summary else "").strip()
     scenario = ScenarioDefinition(
         id=str(uuid.uuid4()),
         name=(name or f"{query} — из прогона {datetime.utcnow():%d.%m %H:%M}")[:255],
         description=description
         or (summary or f"Сценарий, повторяющий последовательность инструментов прогона {task_id}."),
+        proposal_reason=reason,
         steps=json.dumps(steps, ensure_ascii=False),
         source_task_id=task_id,
         scenario_hash=digest,
@@ -190,9 +347,20 @@ def scenario_card(scenario: ScenarioDefinition, *, created: bool = False) -> dic
         "id": scenario.id,
         "name": scenario.name,
         "description": scenario.description,
+        "proposal_reason": scenario.proposal_reason,
+        "source_task_id": scenario.source_task_id,
         "status": scenario.status,
         "steps": len(steps),
         "tools": [s.get("tool") for s in steps],
+        # Детали шагов — для редактора аргументов: без них человек не видит, что заполнять.
+        "steps_detail": [
+            {
+                "tool": s.get("tool"),
+                "description": s.get("description"),
+                "args_template": s.get("args_template") or {},
+            }
+            for s in steps
+        ],
         "needs_args": bool(missing_args),
         "missing_args_tools": missing_args,
         "created": created,

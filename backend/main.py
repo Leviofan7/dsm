@@ -188,6 +188,29 @@ def ensure_artifacts_tables() -> None:
     models.RunJournal.__table__.create(bind=engine, checkfirst=True)
 
 
+def ensure_scenario_proposal_reason() -> None:
+    """
+    Добавляет `scenario_definitions.proposal_reason`, если колонки ещё нет.
+
+    Единственный в проекте `ALTER TABLE ADD COLUMN` и намеренно узкий: колонка nullable,
+    поэтому существующие строки просто получают NULL и пересоздавать таблицу с данными
+    (как в `ensure_action_requests_nullable_source`) не нужно. Проверка идемпотентна —
+    повторные старты ничего не делают.
+    """
+    from sqlalchemy import inspect, text
+
+    from database import engine
+
+    insp = inspect(engine)
+    if "scenario_definitions" not in insp.get_table_names():
+        return
+    if "proposal_reason" in {c["name"] for c in insp.get_columns("scenario_definitions")}:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE scenario_definitions ADD COLUMN proposal_reason TEXT"))
+    logging.info("🔧 scenario_definitions.proposal_reason добавлена (ALTER ADD COLUMN)")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle: при старте — инициализируем LLMManager, Telegram bot info/webhook, при остановке — shutdown."""
@@ -212,6 +235,8 @@ async def lifespan(app: FastAPI):
     ensure_web_sessions_table()
     # Артефакты и журнал прогонов: история работы системы (решение 02.10)
     ensure_artifacts_tables()
+    # Причина предложения сценария — вход для мета-анализа (шаг 3 приоритетов)
+    ensure_scenario_proposal_reason()
     await llm_manager.initialize()
     # Запускаем фоновую очистку сессий и поллер статусов HITL
     asyncio.create_task(hitl_monitor_loop())
@@ -1887,47 +1912,141 @@ async def create_scenario(
     audit.log_action(db, current_user.id, "web_ui", "create_scenario", scenario.id, name, "success")
     return {"status": "ok", "id": scenario.id}
 
+class ScenarioStepsBody(BaseModel):
+    """Тело для заполнения шагов черновика (PUT /scenarios/{id}/steps)."""
+    steps: List[Any]
+
+
+class ScenarioActivationBody(BaseModel):
+    """Явное подтверждение активации: без `confirm=True` сценарий не включается."""
+    confirm: bool = False
+    steps: Optional[List[Any]] = None
+
+
+def _scenario_tool_schemas() -> dict[str, dict] | None:
+    """
+    Входные схемы инструментов из реестра MCP (имя → input_schema).
+
+    `None` означает «схем нет» (реестр пуст — MCP ещё не поднят): тогда валидация честно
+    пропускает проверку обязательных полей и пишет `schema_checked=False`, а не делает вид,
+    что всё сверила. Недоступный реестр тоже трактуем как «схем нет» — валить сохранение
+    сценария из-за неготового MCP неправильно.
+    """
+    try:
+        registry = dict(llm_manager.mcp._tool_registry)
+    except Exception:
+        return None
+    if not registry:
+        return None
+    return {name: (entry or {}).get("input_schema") or {} for name, entry in registry.items()}
+
+
+def _validate_scenario_or_fail(steps: Any) -> dict:
+    """Валидирует шаги и бросает 403/422. Сохранение/активация без проверки невозможны."""
+    report = scenarios_service.validate_scenario_steps(steps, _scenario_tool_schemas())
+    if report["privileged_tools"]:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Сценарий использует привилегированные инструменты — активация заблокирована.",
+                "report": report,
+            },
+        )
+    if not report["valid"]:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": scenarios_service.validation_message(report), "report": report},
+        )
+    return report
+
+
+@app.put("/scenarios/{scenario_id}/steps", dependencies=[Depends(require_admin)])
+async def update_scenario_steps(
+    scenario_id: str,
+    body: ScenarioStepsBody,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_admin),
+):
+    """
+    Заполняет/правит шаги черновика — тот самый «путь человека».
+
+    Предложенный из прогона сценарий приходит с пустыми `args_template`, и до этого
+    заполнить их можно было только правкой БД руками. Теперь есть валидируемый вход:
+    неполные/битые аргументы не сохраняются (422 + отчёт с точным списком полей).
+    """
+    scenario = db.query(ScenarioDefinition).filter(ScenarioDefinition.id == scenario_id).first()
+    if not scenario:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+
+    report = _validate_scenario_or_fail(body.steps)
+
+    scenario.steps = json.dumps(body.steps, ensure_ascii=False)
+    scenario.scenario_hash = scenarios_service.steps_digest(body.steps)
+    # Шаги изменились — прежнее утверждение (если было) недействительно.
+    scenario.approved_hash = None
+    scenario.approved_by = None
+    scenario.approved_at = None
+    if scenario.status == "active":
+        scenario.status = "draft"
+    db.commit()
+    import audit
+    audit.log_action(
+        db, current_user.id, "web_ui", "update_scenario_steps", scenario_id, scenario.name, "success"
+    )
+    return {"status": "validated", "report": report, "scenario": scenarios_service.scenario_card(scenario)}
+
+
 @app.post("/scenarios/{scenario_id}/activate", dependencies=[Depends(require_admin)])
 async def activate_scenario(
     scenario_id: str,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(require_admin)
+    current_user: models.User = Depends(require_admin),
+    body: ScenarioActivationBody | None = None,
 ):
+    """
+    Активирует сценарий ТОЛЬКО по явному подтверждению и с валидными аргументами.
+
+    Тело: `{"confirm": true, "steps": [...]?}`. Если `steps` переданы — они сохраняются
+    (это и есть заполнение аргументов), иначе берём уже сохранённые. Без `confirm=true`
+    отказ: «включить сценарий молча» больше невозможно — именно молчаливый запуск
+    заготовки с пустыми аргументами и был опасен.
+    """
+    if body is None or not body.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail='Активация требует явного подтверждения: передайте {"confirm": true} (и "steps", если заполняете аргументы сейчас).',
+        )
+
     scenario = db.query(ScenarioDefinition).filter(ScenarioDefinition.id == scenario_id).first()
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
-        
-    steps = json.loads(scenario.steps)
-    # Проверка на PRIVILEGED_TOOLS
-    from agent.mcp_manager import PRIVILEGED_TOOLS
 
-    # Сценарий из прогона приходит черновиком с пустыми args_template: активировать его
-    # значило бы «вызови инструменты наугад». Пока аргументы не заполнены руками —
-    # это заготовка для человека, а не автоматизация.
-    missing_args = [s.get("tool") for s in steps if not s.get("args_template")]
-    if missing_args:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "У шагов не заполнены аргументы: "
-                + ", ".join(str(m) for m in missing_args)
-                + ". Заполните args_template и активируйте снова."
-            ),
-        )
-
-    for step in steps:
-        tool_name = step.get("tool")
-        if tool_name in PRIVILEGED_TOOLS:
+    if body.steps is not None:
+        steps = body.steps
+    else:
+        try:
+            steps = json.loads(scenario.steps or "[]")
+        except Exception:
             raise HTTPException(
-                status_code=403, 
-                detail=f"Сценарий использует привилегированный инструмент {tool_name}. Активация заблокирована."
+                status_code=422,
+                detail="Шаги сценария повреждены (не JSON) — заполните их заново через PUT /scenarios/{id}/steps",
             )
-            
+
+    report = _validate_scenario_or_fail(steps)
+
+    stored = json.dumps(steps, ensure_ascii=False)
+    scenario.steps = stored
+    scenario.scenario_hash = scenarios_service.steps_digest(steps)
     scenario.status = "active"
+    # Инвариант исполнения: LinearScenarioExecutor сверяет approved_hash с sha256 СЫРОГО
+    # текста steps. До этого поле никто не заполнял — проверка целостности была мёртвой.
+    scenario.approved_hash = scenarios_service.content_hash(stored)
+    scenario.approved_by = str(current_user.id)
+    scenario.approved_at = datetime.utcnow()
     db.commit()
     import audit
     audit.log_action(db, current_user.id, "web_ui", "activate_scenario", scenario_id, scenario.name, "success")
-    return {"status": "activated"}
+    return {"status": "activated", "report": report, "approved_hash": scenario.approved_hash}
 
 # ── Apprentice Mode ─────────────────────────────────────────────────
 

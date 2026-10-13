@@ -241,6 +241,10 @@ class ScenarioDefinition(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     name = Column(String(255))
     description = Column(Text)
+    #: Почему сценарий предложен (какой прогон, чем он закончился, что вызвал).
+    #: Отдельное поле, а не текст в description: это вход для мета-анализа («из чего
+    #: родился сценарий»), и он не должен смешиваться с человекочитаемым описанием.
+    proposal_reason = Column(Text, nullable=True)
     steps = Column(Text)  # using Text for JSON compatibility across sqlite/pg
     
     intent_id = Column(String(36), ForeignKey("intent_specs.id"), nullable=True)
