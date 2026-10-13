@@ -9,6 +9,7 @@ import {
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { Separator } from "@/components/ui/separator"
+import { ProvidersCard } from "@/components/settings/providers-card"
 
 const indexingOptions = [
   {
@@ -72,6 +73,8 @@ export default function SettingsPage() {
               ))}
             </CardContent>
           </Card>
+
+          <ProvidersCard />
 
         </div>
       </div>

@@ -49,6 +49,8 @@ from services.role_permissions import CALLER_ROLE_META_KEY
 # Имена artifacts-тулов берём из сервиса, чтобы список не расползался копиями.
 from services.mcp_meta import CALLER_TASK_META_KEY
 from services.artifacts import ARTIFACT_TOOLS
+# Здоровье провайдеров: классификация сбоя и кулдаун вместо вечного «available = False».
+from services import provider_health as provider_health_service
 
 logger = logging.getLogger("contextus.llm_manager")
 
@@ -250,6 +252,10 @@ class ModelRegistry:
         candidates = [
             m for m in (model_overrides or ([model_override] if model_override else [])) if m
         ]
+
+        # Кулдаун — не приговор: если срок вышел, модель возвращаем в строй ДО выбора.
+        # Иначе временный лимит/сетевой сбой выключал бы модель до рестарта процесса.
+        provider_health_service.health.recover_expired(self)
 
         for candidate in candidates:
             entry = self.models.get(candidate)
@@ -1007,7 +1013,12 @@ class LLMManager:
 
         if not model:
             logger.error(f"❌ Нет доступной модели для задачи '{task_type}' (complexity={complexity})")
-            yield 'data: ' + json.dumps({"type": "error", "message": f"Ошибка: нет доступной модели для задачи '{task_type}' (complexity={complexity})."}) + '\n\n'
+            # Причина обязана доехать до человека: «нет доступной модели» без деталей —
+            # ровно тот тихий провал, из-за которого инцидент 26.09 выглядел как молчание бота.
+            detail = self._unavailable_message(
+                f"Ошибка: нет доступной модели для задачи '{task_type}' (complexity={complexity})."
+            )
+            yield 'data: ' + json.dumps({"type": "error", "message": detail}) + '\n\n'
             return
 
         yield 'data: ' + json.dumps({"type": "step", "step": "model_selected", "message": f"Выбрана модель: {model.name} ({model.provider_type})"}) + '\n\n'
@@ -1680,7 +1691,7 @@ class LLMManager:
         """
         model, conf, mode, reason = resolve_agent_decision(self.registry, task_type, "auto", query=query)
         if not model:
-            return f"Ошибка: нет доступной модели для задачи '{task_type}'."
+            return self._unavailable_message(f"Ошибка: нет доступной модели для задачи '{task_type}'.")
 
         t_start = time.perf_counter()
         tools_called = 0
@@ -1787,14 +1798,14 @@ class LLMManager:
                             session.complete()
                             session_manager.remove_session(chat_id)
                         self._record_trace(session, chat_id, task_type, task_type, model, tools, tools_called, tools_called_names, t_start, "failure", task_id=task_id)
-                        return "Ошибка: все модели недоступны."
+                        return self._unavailable_message("Ошибка: все модели недоступны.")
 
                 else:
                     if session:
                         session.complete()
                         session_manager.remove_session(chat_id)
                     self._record_trace(session, chat_id, task_type, task_type, model, tools, tools_called, tools_called_names, t_start, "failure", tool_verified, tool_verification_details, task_id=task_id)
-                    return "Ошибка: модель не ответила и нет fallback."
+                    return self._unavailable_message("Ошибка: модель не ответила и нет fallback.")
 
             # Проверяем: есть ли tool_calls?
             tool_calls = self._extract_tool_calls(model, response)
@@ -2289,19 +2300,30 @@ class LLMManager:
         """
         Chat completion с поддержкой tools.
         Возвращает сырой ответ модели (dict) или None при ошибке.
+
+        Сбой не «хоронит» модель навсегда: классифицируем причину (ключ/лимит/сеть) и
+        отправляем в кулдаун соответствующей длины (services/provider_health.py). Раньше
+        любой сбой ставил `available = False` без срока — модель выпадала до рестарта
+        процесса, а «все модели недоступны» не объясняло, что именно случилось.
         """
         try:
             if model.provider_type == "ollama":
-                return await self._chat_ollama(model, messages, tools)
+                result = await self._chat_ollama(model, messages, tools)
             elif model.provider_type == "openai":
-                return await self._chat_openai(model, messages, tools)
+                result = await self._chat_openai(model, messages, tools)
             elif model.provider_type == "anthropic":
-                return await self._chat_anthropic(model, messages, tools)
+                result = await self._chat_anthropic(model, messages, tools)
+            else:
+                return None
         except Exception as e:
-            logger.error(f"  ❌ _chat({model.name}): {repr(e)}")
-            # Помечаем модель как недоступную для будущих вызовов
-            model.available = False
+            kind, detail = provider_health_service.classify_exception(e)
+            logger.error(f"  ❌ _chat({model.name}): {detail}")
+            provider_health_service.health.note_failure(model, kind, detail)
             return None
+
+        if result is not None:
+            provider_health_service.health.note_success(model)
+        return result
 
     async def _chat_ollama(self, model: ModelEntry, messages: list[dict], tools: list[dict] | None, stream_callback=None) -> dict:
         payload: dict[str, Any] = {
@@ -2546,18 +2568,43 @@ class LLMManager:
             }
         return {"role": "tool", "content": result}
 
+    def _unavailable_message(self, prefix: str) -> str:
+        """
+        Причина недоступности в текст для человека.
+
+        «Все модели недоступны» без причины — это и есть тихий провал, из-за которого
+        инцидент 26.09 выглядел как «бот просто не ответил»: непонятно, что чинить —
+        ключ, баланс или сеть.
+        """
+        detail = provider_health_service.health.failure_summary()
+        return f"{prefix} {detail}" if detail else prefix
+
+    def _fallback_candidates(self, task_type: str) -> list[str]:
+        """
+        Кандидаты для подмены упавшей модели: цепочка АГЕНТА, затем routing.
+
+        Почему не только routing (как было): модель выбирает резолвер по настройкам агента
+        (`config/agent_configs.json`), а `_get_fallback` ходил по legacy-цепочке `routing`
+        из models.yaml И требовал, чтобы упавшая модель в ней присутствовала. Если модель
+        пришла из настроек агента и её нет в routing, `found_failed` не срабатывал ни разу —
+        fallback молча возвращал None, то есть был декоративным.
+        """
+        candidates = extract_model_candidates(
+            get_agent_mode_config(load_agent_configs(), task_type, "auto")
+        )
+        for name in self.registry.routing.get(task_type, []):
+            if name not in candidates:
+                candidates.append(name)
+        return candidates
+
     def _get_fallback(self, failed_model: ModelEntry, task_type: str) -> ModelEntry | None:
-        """Ищет следующую доступную модель в цепочке после failed_model."""
-        chain = self.registry.routing.get(task_type, [])
-        found_failed = False
-        for name in chain:
+        """Первая доступная модель из цепочки агента (затем routing), кроме упавшей."""
+        for name in self._fallback_candidates(task_type):
             if name == failed_model.name:
-                found_failed = True
                 continue
-            if found_failed:
-                entry = self.registry.models.get(name)
-                if entry and entry.available:
-                    return entry
+            entry = self.registry.models.get(name)
+            if entry and entry.available:
+                return entry
         return None
 
     async def _reformulate_query(self, model, history: list, query: str) -> str:

@@ -17,6 +17,7 @@ import models
 from auth import require_admin, require_user, get_current_user, create_session_token, verify_session_token
 from datetime import datetime, timedelta
 from services import session_registry
+from services import provider_health as provider_health_service
 from services.indexer import index_github_repo, _process_files_and_index, reindex_source, auto_reindex_if_needed
 from services.vector_store import delete_source_collection
 import httpx
@@ -2227,6 +2228,25 @@ async def get_mcp_servers(authorization: str = Header(None)):
             srv["available"] = srv["available"] and provider_available.get(required_provider, False)
         servers_list.append(srv)
     return {"servers": servers_list}
+
+
+@app.get("/providers/health", dependencies=[Depends(require_admin)])
+async def providers_health(probe: bool = Query(False, description="Живая проверка провайдеров (сеть)")):
+    """
+    Здоровье провайдеров моделей: кто доступен, кто в кулдауне и почему.
+
+    Флага `available` мало: он означает «задан API-ключ». Ключ может быть отозван, баланс
+    исчерпан, провайдер — лежать, и по флагу этого не видно. Поэтому здесь дополнительно
+    класс последнего сбоя и сколько ждать, а по `?probe=true` — ЖИВАЯ проверка
+    (Ollama /api/tags, баланс DeepSeek).
+
+    Ограничение: кулдаун живёт в памяти процесса API, у воркера свой
+    (см. `services/provider_health.py`).
+    """
+    snapshot = provider_health_service.health.snapshot(llm_manager.registry)
+    snapshot["probe"] = await provider_health_service.live_probe() if probe else None
+    return snapshot
+
 
 @app.post("/models/refresh", dependencies=[Depends(require_admin)])
 async def refresh_models(
