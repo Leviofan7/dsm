@@ -48,6 +48,12 @@ export function ChatInterface() {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeConvId, setActiveConvId] = useState<string | null>(null)
   const [convDialogOpen, setConvDialogOpen] = useState(false)
+  // Истекла ли сессия. Раньше 401 молча игнорировался, и после refresh список
+  // бесед выглядел пустым — как будто «все беседы пропали» (жалоба 20.10).
+  const [sessionExpired, setSessionExpired] = useState(false)
+  // Сверку activeConvId с фактическим списком делаем ОДИН раз за загрузку:
+  // иначе периодический refresh мог бы сбросить только что созданную беседу.
+  const reconciledActiveRef = useRef(false)
 
   // --- Sources ---
   const [allSources, setAllSources] = useState<ConnectedSource[]>([])
@@ -137,7 +143,24 @@ export function ChatInterface() {
   async function fetchConversations() {
     try {
       const res = await fetch("/api/conversations")
-      if (res.ok) setConversations(await res.json())
+      if (res.status === 401) {
+        // Данные НЕ потеряны: сервер просто не пускает без сессии. Показываем это
+        // явно, иначе пустой список читается как «все беседы исчезли».
+        setSessionExpired(true)
+        setConversations([])
+        return
+      }
+      if (res.ok) {
+        setSessionExpired(false)
+        const list: Conversation[] = await res.json()
+        setConversations(list)
+        // В localStorage мог остаться id удалённой беседы (или от прошлой сессии):
+        // без сверки UI показывает «выберите беседу», хотя список полный.
+        if (!reconciledActiveRef.current) {
+          reconciledActiveRef.current = true
+          setActiveConvId((prev) => (prev && !list.some((c) => c.id === prev) ? null : prev))
+        }
+      }
     } catch (e) {
       console.error("fetchConversations error:", e)
     }
@@ -146,6 +169,10 @@ export function ChatInterface() {
   async function fetchSources() {
     try {
       const res = await fetch("/api/sources")
+      if (res.status === 401) {
+        setSessionExpired(true)
+        return
+      }
       if (res.ok) setAllSources(await res.json())
     } catch (e) {
       console.error("fetchSources error:", e)
@@ -806,19 +833,49 @@ export function ChatInterface() {
           </div>
         </header>
 
-        {!activeConvId ? (          /* key forces React to remount instead of patch */
-          <div key="empty" className="flex flex-1 items-center justify-center">
-            <div className="text-center">
-              <MessagesSquare className="mx-auto size-12 text-muted-foreground/40 mb-4" />
-              <p className="text-lg font-medium text-muted-foreground">
-                Выберите беседу или создайте новую
-              </p>
-              <Button className="mt-4" onClick={() => setConvDialogOpen(true)}>
-                <MessagesSquare className="size-4 mr-2" />
-                Открыть список бесед
-              </Button>
-            </div>
+        {sessionExpired && (
+          <div className="flex flex-wrap items-center gap-3 border-b border-amber-500/40 bg-amber-500/10 px-5 py-2 text-sm md:px-8">
+            <ShieldAlert className="size-4 shrink-0 text-amber-600" />
+            <span className="min-w-0 flex-1">
+              <b>Сессия истекла.</b> Беседы не потеряны — они скрыты, пока вы не войдёте заново.
+              Отправьте боту <code className="rounded bg-background/60 px-1">/login</code> и откройте полученную ссылку.
+            </span>
+            <Button size="sm" variant="outline" onClick={() => { window.location.href = "/login" }}>
+              Войти
+            </Button>
           </div>
+        )}
+
+        {!activeConvId ? (          /* key forces React to remount instead of patch */
+          sessionExpired ? (
+            <div key="expired" className="flex flex-1 items-center justify-center px-6">
+              <div className="max-w-md text-center">
+                <ShieldAlert className="mx-auto mb-4 size-12 text-amber-500/60" />
+                <p className="text-lg font-medium">Сессия истекла</p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Данные не потеряны: беседы и сообщения остались на сервере. Чтобы вернуться,
+                  отправьте боту команду <code className="rounded bg-background/60 px-1">/login</code>{" "}
+                  и откройте ссылку из ответа.
+                </p>
+                <Button className="mt-4" onClick={() => { window.location.href = "/login" }}>
+                  Перейти ко входу
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div key="empty" className="flex flex-1 items-center justify-center">
+              <div className="text-center">
+                <MessagesSquare className="mx-auto size-12 text-muted-foreground/40 mb-4" />
+                <p className="text-lg font-medium text-muted-foreground">
+                  Выберите беседу или создайте новую
+                </p>
+                <Button className="mt-4" onClick={() => setConvDialogOpen(true)}>
+                  <MessagesSquare className="size-4 mr-2" />
+                  Открыть список бесед
+                </Button>
+              </div>
+            </div>
+          )
         ) : (
           <>
             <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-5 py-6 md:px-8">
