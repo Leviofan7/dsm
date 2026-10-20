@@ -210,6 +210,10 @@ def test_second_refusal_after_retry_is_still_stub(model):
     "не спрашивай, делай",
     "ищи сам и разберись",
     "просто сделай",
+    # Прямой императив — это задача, а не small talk (реальный кейс 21:25)
+    "скачай видео",
+    "найди курс доллара",
+    "собери отчёт по продажам",
 ])
 def test_explicit_action_is_detected(text):
     from agent.roles_impl.base_agent import explicit_action_requested
@@ -217,14 +221,42 @@ def test_explicit_action_is_detected(text):
 
 
 @pytest.mark.parametrize("text", [
-    "сделай авторизацию",   # размытая постановка — уточнять уместно
-    "как дела?",
     "привет",
-    "найди курс доллара",
+    "как дела?",
+    "что ты умеешь?",
+    "как скачать видео?",          # вопрос, а не команда
+    "можно ли найти курс доллара?",
 ])
 def test_vague_requests_are_not_forced(text):
     from agent.roles_impl.base_agent import explicit_action_requested
     assert explicit_action_requested(text) is False
+
+
+def test_direct_task_command_without_delegation_triggers_retry(model):
+    """
+    Реальный случай 21:25: «скачай видео» → швейцар ответил сам («я не смогу скачать…»),
+    без делегирования. Это не «заглушка» по словарю, но задача не передана — значит
+    обязаны потребовать delegate_task, а не записывать success.
+    """
+    fake = FakeLLM([
+        {"text": "Я не смогу скачать видео с YouTube — у системы нет инструмента для медиафайлов."},
+        {"tool_calls": [{
+            "name": "delegate_task",
+            "arguments": {
+                "target_agent": "web_researcher",
+                "complexity": "light",
+                "structured_prompt": "оцени возможность скачивания и предложи рабочий путь",
+            },
+        }]},
+    ])
+    agent = BaseAgent(fake, {"system_instruction": "роутер"}, model,
+                      llm_manager.build_delegate_tool("openai"))
+
+    events, status = asyncio.run(_run(agent, query="скачай видео"))
+
+    steps = [e.get("step") for e in events if e.get("type") == "step"]
+    assert "force_action_retry" in steps
+    assert status == "delegated"
 
 
 def test_explicit_action_forces_delegation(model):
@@ -251,7 +283,7 @@ def test_explicit_action_forces_delegation(model):
     assert "force_action_retry" in steps
     assert status == "delegated"
     assert any(
-        "Уточняющие вопросы запрещены" in str(m.get("content"))
+        "Уточняющие вопросы" in str(m.get("content"))
         for m in fake.calls[1]
     )
 

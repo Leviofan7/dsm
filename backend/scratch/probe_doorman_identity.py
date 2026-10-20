@@ -34,6 +34,12 @@ HISTORY = [
     )},
 ]
 
+#: Можно передать свой запрос: `python probe_doorman_identity.py "скачай видео"`.
+#: История тогда пустая — как в реальном прогоне 21:25, где делегирования не случилось.
+if len(sys.argv) > 1:
+    QUERY = " ".join(sys.argv[1:])
+    HISTORY = []
+
 
 def _parse(events):
     out = []
