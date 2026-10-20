@@ -51,6 +51,8 @@ from services.mcp_meta import CALLER_TASK_META_KEY
 from services.artifacts import ARTIFACT_TOOLS
 # Здоровье провайдеров: классификация сбоя и кулдаун вместо вечного «available = False».
 from services import provider_health as provider_health_service
+# Identity-контекст системы: один и тот же блок во всех ролях (ТЗ «живое окружение», п.1).
+from services.identity import identity_block
 
 logger = logging.getLogger("contextus.llm_manager")
 
@@ -491,6 +493,53 @@ def resolve_agent_model(
         registry, agent_id, complexity, model_override, query=query
     )
     return model, conf
+
+
+def build_delegate_tool(provider_type: str) -> list[dict]:
+    """
+    Схема `delegate_task` с РЕАЛЬНЫМ списком агентов.
+
+    Раньше описание было «Delegate to specialized agent», а `target_agent` — свободной
+    строкой: модель не знала ни кто есть в системе, ни какие значения допустимы. Это
+    второй канал той же проблемы, что и пустой промпт швейцара: инструмент есть, знаний
+    о нём нет. Ростер берётся из `roles/*.yaml` (services/identity.py), поэтому список
+    не расползается с реальностью.
+    """
+    from services.identity import agent_roster
+
+    roster = agent_roster()
+    ids = [r["id"] for r in roster]
+    agents_text = "; ".join(
+        f"{r['id']} — {r['description'] or r['name']}" for r in roster
+    ) or "(список агентов недоступен)"
+    description = f"Передать задачу специализированному агенту. Доступные агенты: {agents_text}"
+
+    target: dict[str, Any] = {
+        "type": "string",
+        "description": "id агента, которому передаётся задача",
+    }
+    if ids:
+        target["enum"] = ids
+
+    params: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "target_agent": target,
+            "complexity": {
+                "type": "string",
+                "enum": ["light", "heavy"],
+                "description": "light — быстрые задачи; heavy — сложные многошаговые",
+            },
+            "structured_prompt": {
+                "type": "string",
+                "description": "Полное ТЗ для агента: что сделать, где, какой результат нужен",
+            },
+        },
+        "required": ["target_agent", "complexity", "structured_prompt"],
+    }
+    if provider_type == "anthropic":
+        return [{"name": "delegate_task", "description": description, "input_schema": params}]
+    return [{"type": "function", "function": {"name": "delegate_task", "description": description, "parameters": params}}]
 
 
 def get_agent_mode_config(agent_configs: dict, agent_id: str, complexity: str) -> dict:
@@ -956,12 +1005,8 @@ class LLMManager:
             logger.info(f"  🚪 Швейцар (doorman) → модель {dm_model.name} ({dm_model.provider_type}), complexity={doorman_complexity}")
             yield 'data: ' + json.dumps({"type": "step", "step": "model_selected", "message": f"Швейцар: модель {dm_model.name} ({dm_model.provider_type})"}) + '\n\n'
 
-            dm_tools = [{"name": "delegate_task", "description": "Delegate to specialized agent", "input_schema": {"type": "object", "properties": {"target_agent": {"type": "string"}, "complexity": {"type": "string"}, "structured_prompt": {"type": "string"}}, "required": ["target_agent", "complexity", "structured_prompt"]}}] # Mock schema, liteLLM will format it
-
-            if dm_model.provider_type == "anthropic":
-                dm_tools = [{"name": "delegate_task", "description": "Delegate to specialized agent", "input_schema": {"type": "object", "properties": {"target_agent": {"type": "string"}, "complexity": {"type": "string"}, "structured_prompt": {"type": "string"}}, "required": ["target_agent", "complexity", "structured_prompt"]}}]
-            else:
-                dm_tools = [{"type": "function", "function": {"name": "delegate_task", "description": "Delegate to specialized agent", "parameters": {"type": "object", "properties": {"target_agent": {"type": "string"}, "complexity": {"type": "string"}, "structured_prompt": {"type": "string"}}, "required": ["target_agent", "complexity", "structured_prompt"]}}}]
+            # Схема с реальным ростером агентов (раньше был mock без имён и enum)
+            dm_tools = build_delegate_tool(dm_model.provider_type)
 
             yield 'data: ' + json.dumps({"type": "step", "step": "init", "message": "Встреча (Doorman)..."}) + '\n\n'
             
@@ -979,10 +1024,13 @@ class LLMManager:
 
             # Телеметрия: ответы швейцара тоже должны попадать в ExecutionTrace,
             # иначе такие диалоги выпадают из аналитики целиком.
+            # Статус берём у агента: отказ модели (stub_response) — не «success»,
+            # иначе self_review показывал «отклонений нет» на отказе от задачи.
+            dm_status = "delegated" if delegation_data else getattr(doorman, "final_status", "success")
             self._record_trace(
                 None, None, "doorman_chat", "doorman_chat",
                 dm_model, dm_tools, 0, [], dm_started_at,
-                "delegated" if delegation_data else "success",
+                dm_status,
                 session_id=task_id, task_id=task_id,
             )
                 
@@ -1290,7 +1338,11 @@ class LLMManager:
                     # Фаза B: intent-тулы по правам роли подзадачи
                     st_tools = self._filter_intent_tools(st_tools or [], st_model, target_role)
 
-                st_sys_prompt = role_cfg.get("system_instruction", "Ты — автономный ИИ-агент Contextus. Отвечай на языке пользователя.\n") if role_cfg else "Ты — автономный ИИ-агент Contextus. Отвечай на языке пользователя.\n"
+                st_role_prompt = role_cfg.get("system_instruction", "Ты — автономный ИИ-агент Contextus. Отвечай на языке пользователя.\n") if role_cfg else "Ты — автономный ИИ-агент Contextus. Отвечай на языке пользователя.\n"
+                # Identity-контекст (ТЗ «Папка как живое окружение», п.1): роль подзадачи
+                # должна знать, где она работает и что у системы есть, иначе отвечает
+                # «я не могу» вместо вызова инструментов.
+                st_sys_prompt = identity_block() + "\n\n" + st_role_prompt
                 
                 if st_has_tools:
                     tool_names_list = [t["name"] if st_model.provider_type == "anthropic" else t["function"]["name"] for t in (st_tools or []) if (t["name"] if st_model.provider_type == "anthropic" else t["function"]["name"]) != "get_raw_html"]

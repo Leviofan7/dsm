@@ -828,7 +828,11 @@ async def process_telegram_message(chat_id: int, text: str):
     role_instruction = load_role_instruction(role_name)
     
     # Базовый промпт
-    system_prompt = "Ты — ИИ-агент Contextus. Отвечай на русском языке."
+    # Identity-контекст обязателен и здесь: без него Telegram-путь отвечал «я не могу»,
+    # не зная ни возможностей системы, ни своих границ (тот же класс проблемы, что у швейцара).
+    from services.identity import identity_block
+
+    system_prompt = identity_block() + "\n\n" + "Ты — ИИ-агент Contextus. Отвечай на русском языке."
     if role_instruction:
         system_prompt += f"\n\nТвоя роль и инструкции:\n{role_instruction}"
     elif task_type == "browser_automation":

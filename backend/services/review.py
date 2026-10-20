@@ -88,13 +88,25 @@ def classify_failure(
     и «заглушка», и ошибки инструментов одновременно, но исправлять надо первопричину.
     """
     normalized = (status or "").lower()
+    metrics = metrics or {}
+    trace_statuses = {str(s).lower() for s in (metrics.get("statuses") or [])}
+
+    # Провал ВНУТРИ «успешного» прогона: задача закрылась как completed, но трейс говорит
+    # stub_response. Это НЕ «отклонений нет» — иначе отказ швейцара остаётся невидимым
+    # (реальный случай 15.10: doorman_chat/success при тексте «я не могу скачать файл»).
+    if "stub_response" in trace_statuses:
+        return "stub_response"
+
+    # Просили действовать, а агент ограничился уточняющими вопросами — это «не вызвал
+    # инструменты», а не норма. См. BaseAgent.final_status="no_delegation".
+    if "no_delegation" in trace_statuses:
+        return "model_declined_tools"
+
     if normalized in _SUCCESS_STATUSES:
         return "none"
     if normalized == "cancelled":
         return "cancelled"
 
-    metrics = metrics or {}
-    trace_statuses = {str(s).lower() for s in (metrics.get("statuses") or [])}
     blob = " ".join(str(e).lower() for e in (errors or []))
 
     if "stub_response" in trace_statuses or any(
