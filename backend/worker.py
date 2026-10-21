@@ -1,13 +1,14 @@
 import os
 import asyncio
 import logging
+from datetime import datetime, timedelta
 from arq.connections import RedisSettings
 from arq.worker import Worker
 from sqlalchemy.orm import Session
 
 from database import SessionLocal
 from agent.llm_manager import LLMManager
-from models import AgentTask, AgentTaskEvent, ActionRequest
+from models import AgentTask, AgentTaskEvent, ActionRequest, ApprenticeStep
 
 # ── Логирование ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -37,6 +38,28 @@ async def shutdown(ctx):
     if 'llm_manager' in ctx:
         await ctx['llm_manager'].shutdown()
 
+
+def expire_pending_apprentice_steps(db: Session, session_ids: list[str | None]) -> int:
+    """
+    Гасит висящие подтверждения (`human_decision IS NULL`) для указанных сессий.
+
+    Нужно потому, что ожидание решения живёт ВНУТРИ прогона: если воркер перезапустили
+    или ARQ сделал ретрай, ожидающего уже нет, а строка в БД остаётся и продолжает
+    показываться пользователю как «ожидает решения». Возвращает число погашенных.
+    """
+    ids = [s for s in session_ids if s]
+    if not ids:
+        return 0
+    rows = db.query(ApprenticeStep).filter(
+        ApprenticeStep.session_id.in_(ids),
+        ApprenticeStep.human_decision == None,  # noqa: E711 — SQL IS NULL
+    ).all()
+    now = datetime.utcnow()
+    for row in rows:
+        row.human_decision = "expired"
+        row.decided_at = now
+    return len(rows)
+
 async def run_agent_task(ctx, task_id: str, query: str, chat_id: int, history: list, accounts: list, source_ids: list, attached_folders: list, target_agent: str = "auto", mode: str = "auto", complexity: str = "auto"):
     """Главная задача ARQ: запуск агента и обработка его цикла."""
     logger.info(f"Начало выполнения задачи {task_id} для chat_id={chat_id}")
@@ -60,6 +83,22 @@ async def run_agent_task(ctx, task_id: str, query: str, chat_id: int, history: l
         return
     finally:
         db.close()
+
+    # 1.1. Гасим осиротевшие apprentice-шаги прошлой попытки.
+    # ARQ ретраит задачу после рестарта воркера (`try=2`): агент стартует заново,
+    # а карточки подтверждения от убитой попытки остаются с human_decision = NULL
+    # навсегда и продолжают висеть в UI (на разборе инцидента их было 4, два — с июля).
+    try:
+        db = SessionLocal()
+        try:
+            expired = expire_pending_apprentice_steps(db, [str(task_id), str(chat_id) if chat_id else None])
+            if expired:
+                db.commit()
+                logger.info(f"Погашено осиротевших apprentice-шагов прошлой попытки: {expired}")
+        finally:
+            db.close()
+    except Exception as e:  # noqa: BLE001 — уборка не имеет права сорвать прогон
+        logger.warning(f"Не удалось погасить осиротевшие apprentice-шаги: {e}")
 
     try:
         # 2. Выполняем стрим. Воркер перехватывает yield и пишет в БД/Redis.
@@ -155,6 +194,12 @@ async def run_agent_task(ctx, task_id: str, query: str, chat_id: int, history: l
         if task:
             task.status = "cancelled"
             db.commit()
+            # Ожидающего больше нет — карточка подтверждения не должна пережить прогон.
+            try:
+                expire_pending_apprentice_steps(db, [task_id, task.conversation_id])
+                db.commit()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Не удалось погасить apprentice-шаги при отмене {task_id}: {e}")
             # Отмена — тоже исход: без строки в журнале прогон «исчезает» из истории
             artifacts_service.finalize_journal(
                 db, task_id, status="cancelled", summary="прогон отменён (cancel/перезапуск сервиса)"
@@ -210,7 +255,22 @@ async def cancel_stuck_hitl_tasks(ctx):
         for task in stuck_tasks:
             task.status = "cancelled"
             logger.info(f"Задача {task.id} отменена по TTL (HITL timeout)")
-        
+
+        # Просроченные подтверждения гасим независимо от статуса задачи: ожидание живёт
+        # внутри прогона, и если прогон умер (рестарт/ретрай), ждать уже некому. Срок
+        # ожидания внутри execute_apprentice_step — 15 мин, поэтому 30 мин здесь заведомо
+        # означает «осиротевший шаг», а не «человек думает».
+        stale_steps = db.query(ApprenticeStep).filter(
+            ApprenticeStep.human_decision == None,  # noqa: E711 — SQL IS NULL
+            ApprenticeStep.created_at < timeout_threshold,
+        ).all()
+        now = datetime.utcnow()
+        for step in stale_steps:
+            step.human_decision = "expired"
+            step.decided_at = now
+        if stale_steps:
+            logger.info(f"Погашено просроченных apprentice-шагов: {len(stale_steps)}")
+
         db.commit()
     except Exception as e:
         logger.error(f"Ошибка в cron-задаче cancel_stuck_hitl_tasks: {e}")

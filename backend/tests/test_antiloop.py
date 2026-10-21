@@ -98,6 +98,10 @@ async def test_antiloop_stops_on_repeated_error_bodies():
     chat_calls = []
 
     async def mock_chat(model, messages, tools=None):
+        if tools is None:
+            # Фаза плана (2–3 шага перед действием) идёт отдельным вызовом без инструментов
+            # и не должна попадать в счётчик раундов цикла.
+            return {"choices": [{"message": {"role": "assistant", "content": '{"steps": ["прочитать файл"]}'}}]}
         chat_calls.append(1)
         path = next(paths, "backend/models.py")
         return _fake_openai_response("read_file", {"relative_path": path})

@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { Check, ChevronDown, GraduationCap, Bot } from "lucide-react"
+import { Check, ChevronDown, Bot } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import {
@@ -24,11 +24,9 @@ type AgentOption = {
 interface AgentSelectorProps {
   value: string
   onChange: (value: string) => void
-  mode: string
-  onModeChange: (value: string) => void
 }
 
-export function AgentSelector({ value, onChange, mode, onModeChange }: AgentSelectorProps) {
+export function AgentSelector({ value, onChange }: AgentSelectorProps) {
   const [agents, setAgents] = useState<AgentOption[]>([
     { id: "auto", name: "Auto (Doorman)", description: "Автоматический выбор агента", type: "auto" }
   ])
@@ -136,20 +134,6 @@ export function AgentSelector({ value, onChange, mode, onModeChange }: AgentSele
           )}
         </DropdownMenuContent>
       </DropdownMenu>
-
-      <Button
-        variant={mode === "apprentice" ? "default" : "outline"}
-        size="sm"
-        className={cn(
-          "h-8 px-2 text-xs gap-1.5 transition-all",
-          mode === "apprentice" && "bg-amber-600 hover:bg-amber-700 border-amber-600 text-white"
-        )}
-        onClick={() => onModeChange(mode === "apprentice" ? "auto" : "apprentice")}
-        title="Apprentice Mode (Ученик) — каждый шаг агента требует вашего одобрения"
-      >
-        <GraduationCap className="size-3.5" />
-        {mode === "apprentice" && <span className="hidden sm:inline">Ученик</span>}
-      </Button>
     </div>
   )
 }

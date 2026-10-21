@@ -12,10 +12,14 @@ export interface AgentThinkingStep {
   type: "step" | "error" | "done"
   message: string
   timestamp: number
-  /** Тип события от бэкенда (init, model_selected, generating, thought…) */
+  /** Тип события от бэкенда (init, model_selected, generating, thought…, plan) */
   step_type?: string
   /** Base64 screenshot attached to block/error events */
   screenshot?: string
+  /** Кто именно выполняет шаг (doorman / code_architect / web_researcher…) */
+  role?: string
+  /** Шаги плана, если событие типа plan */
+  planSteps?: string[]
 }
 
 interface AgentThinkingBubbleProps {
@@ -154,6 +158,11 @@ export function AgentThinkingBubble({ steps, isWorking }: AgentThinkingBubblePro
                   </div>
                   {/* Text + optional screenshot */}
                   <div className="flex-1 min-w-0 pb-1">
+                    {step.role && (
+                      <span className="mb-1 inline-flex items-center rounded-full border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-[10px] font-medium text-purple-300">
+                        {step.role}
+                      </span>
+                    )}
                     <p className={cn(
                       "text-xs leading-relaxed",
                       step.type === "error" && "text-red-400",
@@ -167,6 +176,16 @@ export function AgentThinkingBubble({ steps, isWorking }: AgentThinkingBubblePro
                         <span className="ml-1 inline-block w-1.5 h-3 align-middle bg-purple-400 animate-pulse rounded-sm" />
                       )}
                     </p>
+                    {step.planSteps && step.planSteps.length > 0 && (
+                      <ol className="mt-1.5 space-y-1 rounded-lg border border-blue-500/20 bg-blue-500/5 p-2">
+                        {step.planSteps.map((planStep, idx) => (
+                          <li key={idx} className="flex gap-1.5 text-[11px] leading-snug text-foreground/80">
+                            <span className="font-mono text-blue-400">{idx + 1}.</span>
+                            <span className="min-w-0">{planStep}</span>
+                          </li>
+                        ))}
+                      </ol>
+                    )}
                     {step.screenshot && (
                       <ScreenshotPreview base64={step.screenshot} />
                     )}

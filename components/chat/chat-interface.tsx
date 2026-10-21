@@ -25,6 +25,7 @@ import { FileTree } from "@/components/chat/file-tree"
 import { MessageBubble } from "@/components/chat/message-bubble"
 import { AgentToggle, type AgentAccount } from "@/components/chat/agent-toggle"
 import { AgentSelector } from "@/components/chat/agent-selector"
+import { PermissionSelector, normalizeLevel, type PermissionLevel } from "@/components/chat/permission-selector"
 import { ComplexityToggle } from "@/components/chat/complexity-toggle"
 import { ApprenticeCard, type ApprenticeStep } from "@/components/chat/apprentice-card"
 import { AgentThinkingBubble, type AgentThinkingStep } from "@/components/chat/agent-thinking-bubble"
@@ -91,9 +92,20 @@ export function ChatInterface() {
   const [debugMode, setDebugMode] = useState(false)
   const [isAnalyzing, setIsAnalyzing] = useState(false)
   const [targetAgent, setTargetAgent] = useState("auto")
-  const [mode, setMode] = useState("auto")
+  // Уровень доступа вместо бинарного «Ученик»: спрашивать / разрешить всё / автопилот.
+  // Хранится в localStorage — выбор человека переживает перезагрузку страницы.
+  const [permission, setPermission] = useState<PermissionLevel>("allow_all")
   const [complexity, setComplexity] = useState<"light" | "heavy" | "auto">("auto")
   const [pendingApprenticeStep, setPendingApprenticeStep] = useState<ApprenticeStep | null>(null)
+
+  useEffect(() => {
+    setPermission(normalizeLevel(localStorage.getItem("chatPermission")))
+  }, [])
+
+  const handlePermissionChange = (level: PermissionLevel) => {
+    setPermission(level)
+    localStorage.setItem("chatPermission", level)
+  }
 
   useEffect(() => {
     const saved = localStorage.getItem("chatComplexity")
@@ -239,9 +251,10 @@ export function ChatInterface() {
   }
 
   // ========== Init & effects ==========
-  // Poll for Apprentice pending step when mode is apprentice and agent is working
+  // Опрос висящего подтверждения: нужен только на уровне «Спрашивать» — на остальных
+  // бэкенд карточек не создаёт, и лишний запрос раз в 2 секунды бесполезен.
   useEffect(() => {
-    if (mode !== "apprentice" || !activeConvId) {
+    if (permission !== "ask" || !activeConvId) {
       setPendingApprenticeStep(null)
       return
     }
@@ -266,7 +279,7 @@ export function ChatInterface() {
 
     interval = setInterval(checkPending, 2000)
     return () => clearInterval(interval)
-  }, [mode, activeConvId])
+  }, [permission, activeConvId])
 
   const handleApprenticeAccept = async (id: string) => {
     const res = await fetch(`/api/apprentice/step/${id}/accept`, { method: "POST" })
@@ -535,7 +548,7 @@ export function ChatInterface() {
           debugMode,
           sourceIds: activeConv?.sourceIds || [],
           targetAgent: targetAgent,
-          mode: mode,
+          mode: permission,
           complexity: complexity,
           chatId: activeConvId,
         }),
@@ -613,6 +626,10 @@ export function ChatInterface() {
                     message: parsed.message || `Шаг: ${parsed.step}`,
                     timestamp: Date.now(),
                     screenshot: parsed.screenshot || undefined,
+                    // Атрибуция роли: без неё после делегирования не видно, КТО действует
+                    // (швейцар и исполнитель могут быть на одной и той же модели).
+                    role: parsed.role || undefined,
+                    planSteps: Array.isArray(parsed.steps) && parsed.steps.length > 0 ? parsed.steps : undefined,
                   }])
                 } else if (parsed.type === "thought_chunk") {
                   setAgentSteps(prev => {
@@ -630,7 +647,8 @@ export function ChatInterface() {
                          type: "step",
                          step_type: "thought",
                          message: `🤔 ${parsed.content}`,
-                         timestamp: Date.now()
+                         timestamp: Date.now(),
+                         role: parsed.role || undefined,
                        });
                     }
                     return newSteps;
@@ -932,8 +950,10 @@ export function ChatInterface() {
                                     <AgentSelector 
                     value={targetAgent} 
                     onChange={setTargetAgent} 
-                    mode={mode} 
-                    onModeChange={setMode} 
+                  />
+                  <PermissionSelector
+                    value={permission}
+                    onChange={handlePermissionChange}
                   />
                   <ComplexityToggle
                     value={complexity}

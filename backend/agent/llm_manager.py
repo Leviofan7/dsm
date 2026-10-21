@@ -24,6 +24,7 @@ from typing import Any
 import uuid
 
 import time
+from datetime import datetime
 from database import SessionLocal
 from models import AgentTask, AgentSubtask, ExecutionTrace, ApprenticeStep, Source
 
@@ -53,6 +54,9 @@ from services.artifacts import ARTIFACT_TOOLS
 from services import provider_health as provider_health_service
 # Identity-контекст системы: один и тот же блок во всех ролях (ТЗ «живое окружение», п.1).
 from services.identity import identity_block
+# Уровни доступа: read-only шаги не должны останавливать прогон, а ожидание решения
+# обязано иметь срок (раньше ждали вечно и держали слот воркера).
+from services import permissions as permissions_service
 
 logger = logging.getLogger("contextus.llm_manager")
 
@@ -915,9 +919,31 @@ class LLMManager:
         """
         Создает ApprenticeStep и ждет решения человека.
         Возвращает {'decision': '...', 'corrected_args': ...}
+
+        Две страховки, которых раньше не было:
+
+        * **Срок ожидания** (`APPRENTICE_WAIT_TIMEOUT`, по умолчанию 15 минут). Раньше
+          цикл опроса был бесконечным: забытое подтверждение навсегда занимало слот
+          воркера (max_jobs=10) и оставляло «висящую» карточку в UI. По истечении срока
+          шаг помечается `timeout`, а прогон завершается честно, а не молча.
+        * **Гашение осиротевших шагов.** При рестарте воркера/ретрае предыдущий шаг
+          оставался `human_decision = NULL` навсегда — в базе копился мусор (на момент
+          разбора висело 4 таких шага, два из них с июля). Новый шаг в той же сессии
+          помечает прошлые как `expired`: у пользователя всегда не больше одной карточки.
         """
         db = SessionLocal()
         try:
+            now = datetime.utcnow()
+            stale = db.query(ApprenticeStep).filter(
+                ApprenticeStep.session_id == session_id,
+                ApprenticeStep.human_decision == None,  # noqa: E711 — SQL IS NULL
+            ).all()
+            for old in stale:
+                old.human_decision = "expired"
+                old.decided_at = now
+            if stale:
+                logger.info(f"  🧹 Погашено осиротевших apprentice-шагов: {len(stale)} (сессия {session_id})")
+
             step = ApprenticeStep(
                 session_id=session_id,
                 proposed_tool=proposed_tool,
@@ -931,7 +957,9 @@ class LLMManager:
             step_id = step.id
         finally:
             db.close()
-            
+
+        deadline = time.monotonic() + permissions_service.WAIT_TIMEOUT_SECONDS
+
         # Ожидание решения
         while True:
             await asyncio.sleep(1.0)
@@ -941,10 +969,102 @@ class LLMManager:
                 if current_step and current_step.human_decision:
                     return {
                         "decision": current_step.human_decision,
-                        "corrected_args": json.loads(current_step.corrected_args) if current_step.corrected_args else None
+                        "corrected_args": json.loads(current_step.corrected_args) if current_step.corrected_args else None,
+                        "corrected_reasoning": current_step.corrected_reasoning,
                     }
+                if time.monotonic() > deadline:
+                    # Срок истёк: помечаем шаг, чтобы карточка не висела в UI вечно.
+                    current_step.human_decision = "timeout"
+                    current_step.decided_at = datetime.utcnow()
+                    db.commit()
+                    minutes = int(permissions_service.WAIT_TIMEOUT_SECONDS // 60)
+                    logger.warning(
+                        f"  ⏱ Apprentice-шаг {step_id} ({proposed_tool}) не подтверждён за {minutes} мин — timeout"
+                    )
+                    return {"decision": "timeout", "corrected_args": None, "corrected_reasoning": None}
             finally:
                 db.close()
+
+    # ── План перед действием ───────────────────────────────────────
+
+    def _apprentice_session_id(self, task_id: str) -> str:
+        """Сессия для карточки подтверждения = беседа задачи (иначе id самой задачи)."""
+        db = SessionLocal()
+        try:
+            task_obj = db.query(AgentTask).filter(AgentTask.id == task_id).first()
+            if task_obj and task_obj.conversation_id:
+                return task_obj.conversation_id
+            return task_id
+        finally:
+            db.close()
+
+    @staticmethod
+    def _parse_plan(text: str) -> list[str]:
+        """
+        Достаёт 2–3 шага из ответа модели.
+
+        Модели отвечают то JSON-ом, то списком — принимаем оба варианта, потому что
+        план нужен как наблюдаемость, а не как строгий контракт: строгий парсинг
+        молча терял бы план целиком.
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return []
+
+        steps: list[str] = []
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end > start:
+            try:
+                data = json.loads(raw[start:end + 1])
+                if isinstance(data, dict):
+                    candidate = data.get("steps") or data.get("plan") or []
+                    if isinstance(candidate, str):
+                        candidate = [candidate]
+                    steps = [str(s).strip() for s in candidate if str(s).strip()]
+            except Exception:
+                steps = []
+
+        if not steps:
+            for line in raw.splitlines():
+                m = re.match(r"^\s*(?:\d+[.)]|[-*•])\s+(.{3,200})$", line)
+                if m:
+                    steps.append(m.group(1).strip())
+
+        # Дубликаты не нужны: повтор шага в плане — шум, а не информация.
+        unique: list[str] = []
+        for step in steps:
+            if step not in unique:
+                unique.append(step)
+        return unique[:3]
+
+    async def _make_plan(self, model: "ModelEntry", role_label: str, role_instruction: str, query: str) -> list[str]:
+        """
+        Один дешёвый вызов без инструментов: «что собираешься сделать, 2–3 шага».
+
+        Зачем отдельный вызов, а не разбор thought: модель на первом раунде сразу
+        зовёт инструмент, и плана в тексте просто нет. Планирование до действия —
+        единственный способ показать человеку намерение ДО необратимого шага.
+        """
+        prompt = (
+            f"Задача пользователя:\n{query}\n\n"
+            f"Инструкция роли «{role_label}»:\n{(role_instruction or '').strip()[:1200]}\n\n"
+            "Сформулируй КОРОТКИЙ план действий: 2–3 шага, не больше трёх.\n"
+            "Каждый шаг — конкретное действие с инструментом, без рассуждений.\n"
+            'Верни ТОЛЬКО JSON: {"steps": ["шаг 1", "шаг 2"]}'
+        )
+        try:
+            resp = await self._chat(
+                model,
+                [
+                    {"role": "system", "content": "Ты — планировщик действий агента. Отвечай только JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                tools=None,
+            )
+            return self._parse_plan(self._extract_text(model, resp) or "")
+        except Exception as e:  # noqa: BLE001 — план не имеет права уронить прогон
+            logger.warning(f"  ⚠️ План не получен ({type(e).__name__}: {e}) — продолжаю без плана")
+            return []
 
     # ── Execute Stream: полный цикл с выдачей SSE-событий ──────────
 
@@ -1069,7 +1189,16 @@ class LLMManager:
             yield 'data: ' + json.dumps({"type": "error", "message": detail}) + '\n\n'
             return
 
-        yield 'data: ' + json.dumps({"type": "step", "step": "model_selected", "message": f"Выбрана модель: {model.name} ({model.provider_type})"}) + '\n\n'
+        # Имя роли в событии обязательно: после делегирования швейцар и исполнитель могут
+        # работать на одной и той же модели (doorman.light = code_architect.heavy = deepseek-chat),
+        # и без подписи в UI не отличить, кто именно действует.
+        yield 'data: ' + json.dumps({
+            "type": "step",
+            "step": "model_selected",
+            "message": f"{task_type}: {model.name} ({model.provider_type})",
+            "role": task_type,
+            "model": model.name,
+        }) + '\n\n'
 
         if history:
             query = await self._reformulate_query(model, history, query)
@@ -1146,6 +1275,32 @@ class LLMManager:
             if has_tools:
                 tool_names_list = [t["name"] if model.provider_type == "anthropic" else t["function"]["name"] for t in (tools or []) if (t["name"] if model.provider_type == "anthropic" else t["function"]["name"]) != "get_raw_html"]
                 system_prompt += f"ДОСТУПНЫЕ ИНСТРУМЕНТЫ: {', '.join(tool_names_list)}\nВАЖНО: Если задача требует поиска актуальных данных, цен, сайтов, файлов или действий в окружении — ОБЯЗАТЕЛЬНО используй доступные инструменты (например web_search, goto_url). ЗАПРЕЩЕНО выдумывать факты или отвечать из головы, если требуются реальные данные.\n"
+
+        # ── Агентский слой для исполнителя ────────────────────────────
+        # Раньше здесь был ТОЛЬКО `system_instruction` роли: делегированный агент не знал,
+        # где он работает, что умеет система и что у него есть инструменты. Швейцар
+        # (BaseAgent) получал identity_block с самого начала — исполнители нет, хотя именно
+        # они выполняют работу. Отсюда «я бы вызвал инструмент…» вместо вызова.
+        if tools is not None:
+            tool_names_for_identity = [
+                t["name"] if model.provider_type == "anthropic" else t["function"]["name"]
+                for t in (tools or [])
+            ]
+            system_prompt = (
+                identity_block(include_agents=("delegate_task" in tool_names_for_identity))
+                + "\n\n" + system_prompt
+            )
+            system_prompt += (
+                "\n\n=== ПРАВИЛА ДЕЙСТВИЯ ===\n"
+                "- Ты ДЕЙСТВУЕШЬ инструментами, а не рассказываешь, что сделал бы. Если для шага\n"
+                "  есть подходящий инструмент — вызови его, и только потом пиши вывод.\n"
+                "- Запрещено: «я бы вызвал…», «в реальном окружении я бы…», «как LLM я не могу…»,\n"
+                "  «вот код, который нужно запустить». Это не выполнение задачи.\n"
+                "- Ошибка инструмента — это данные: прочитай текст ошибки и попробуй другой путь.\n"
+                "- Не придумывай результаты: то, что не получено вызовом инструмента, не существует.\n"
+                f"- Твои инструменты: {', '.join(tool_names_for_identity) or '(нет)'}.\n"
+                "========================\n"
+            )
 
         # Gate 2.0: инструменты request_* требуют coder_task_id — иначе агент физически
         # не может их вызвать и начинает выдумывать идентификатор. Отдаём его явно.
@@ -1537,15 +1692,102 @@ class LLMManager:
 
 
         # Fallback to standard execution if no tools/not planning
-        yield 'data: ' + json.dumps({"type": "step", "step": "success", "message": "Переход к стандартному циклу..."}) + '\n\n'
-        
+        level = permissions_service.normalize_level(mode)
+
+        def sse_step(step: str, message: str, **extra) -> str:
+            """Шаг с атрибуцией роли: без неё в UI не видно, КТО работает после делегирования."""
+            payload = {"type": "step", "step": step, "message": message, "role": task_type}
+            payload.update(extra)
+            return 'data: ' + json.dumps(payload) + '\n\n'
+
+        async def stream_result(text: str):
+            for i in range(0, len(text), 5):
+                yield 'data: ' + json.dumps({"type": "result", "content": text[i:i + 5]}) + '\n\n'
+                await asyncio.sleep(0.03)
+
+        yield sse_step("success", "Переход к стандартному циклу...")
+
+        std_started = time.perf_counter()
+
+        # ── План перед действием ───────────────────────────────────────
+        # Требование: до первого инструмента агент формулирует 2–3 шага и (на уровне
+        # «Спрашивать») получает разрешение. Раньше прогон начинался сразу с вызова —
+        # человек видел уже совершённое действие и мог только отклонить следующее.
+        plan_steps: list[str] = []
+        if permissions_service.plan_enabled(level) and tools:
+            role_instruction = (role_cfg or {}).get("system_instruction", "") if isinstance(role_cfg, dict) else ""
+            plan_steps = await self._make_plan(model, task_type, role_instruction, query)
+            if plan_steps:
+                yield sse_step(
+                    "plan",
+                    f"План ({task_type}): " + "; ".join(f"{i + 1}) {s}" for i, s in enumerate(plan_steps)),
+                    steps=plan_steps,
+                    model=model.name,
+                    permission=level,
+                )
+                if permissions_service.plan_requires_approval(level) and task_id:
+                    yield 'data: ' + json.dumps({
+                        "type": "apprentice_request",
+                        "kind": "plan",
+                        "tool": permissions_service.PLAN_TOOL,
+                        "args": {"steps": plan_steps},
+                        "role": task_type,
+                    }) + '\n\n'
+                    plan_decision = await self.execute_apprentice_step(
+                        self._apprentice_session_id(task_id),
+                        permissions_service.PLAN_TOOL,
+                        {"steps": plan_steps},
+                        f"План действий перед выполнением ({task_type})",
+                        None,
+                    )
+                    decision = plan_decision.get("decision")
+                    if decision == "rejected":
+                        text = (
+                            "План отклонён оператором — ни один инструмент не вызывался. "
+                            "Уточните задачу или измените план."
+                        )
+                        self._record_trace(
+                            None, None, task_type, task_type, model, tools, 0, [], std_started,
+                            "no_delegation", session_id=task_id, task_id=task_id,
+                        )
+                        async for chunk in stream_result(text):
+                            yield chunk
+                        return
+                    if decision == "timeout":
+                        text = (
+                            f"План не был подтверждён за {int(permissions_service.WAIT_TIMEOUT_SECONDS // 60)} мин — "
+                            "прогон остановлен до действий. Отправьте задачу заново, когда сможете подтвердить."
+                        )
+                        self._record_trace(
+                            None, None, task_type, task_type, model, tools, 0, [], std_started,
+                            "timeout", session_id=task_id, task_id=task_id,
+                        )
+                        async for chunk in stream_result(text):
+                            yield chunk
+                        return
+                    if decision == "corrected":
+                        corrected = plan_decision.get("corrected_args") or {}
+                        if isinstance(corrected, dict) and corrected.get("steps"):
+                            plan_steps = [str(s) for s in corrected["steps"]][:3]
+                            yield sse_step("plan", "План обновлён оператором", steps=plan_steps)
+
+                # План уходит в контекст как согласованное намерение: модель продолжает
+                # с него, а не придумывает линию заново.
+                messages.append({
+                    "role": "assistant",
+                    "content": "ПЛАН:\n" + "\n".join(f"{i + 1}. {s}" for i, s in enumerate(plan_steps)),
+                })
+
         final_text = "ОК"
+        final_status = "success"
+        executed_tool_names: list[str] = []
+        stub_retried = False
         error_hashes = []
         call_signatures: list[str] = []          # anti-loop: подписи вызовов (tool + args)
         result_error_signatures: list[str] = []  # anti-loop: подписи ошибок внутри результатов
         no_progress_stop = False
         for round_num in range(max_tool_rounds):
-            yield 'data: ' + json.dumps({"type": "step", "step": "generating", "message": f"Ожидание ответа от {model.name} (генерация может занять до минуты)..."}) + '\n\n'
+            yield sse_step("generating", f"{task_type}: ожидание ответа от {model.name} (генерация может занять до минуты)...")
             resp = None
             ollama_streamed_content = ""  # Track content streamed live for Ollama
             if model.provider_type == "ollama":
@@ -1553,7 +1795,7 @@ class LLMManager:
                     async for chunk_type, chunk_data in self._chat_ollama_stream(model, messages, tools):
                         if chunk_type == "thought_chunk":
                             ollama_streamed_content += chunk_data
-                            yield 'data: ' + json.dumps({"type": "thought_chunk", "content": chunk_data}) + '\n\n'
+                            yield 'data: ' + json.dumps({"type": "thought_chunk", "content": chunk_data, "role": task_type}) + '\n\n'
                         elif chunk_type == "final":
                             resp = chunk_data
                 except Exception as e:
@@ -1570,7 +1812,7 @@ class LLMManager:
             
             agent_thought = self._extract_text(model, resp)
             if agent_thought and agent_thought.strip() and model.provider_type != "ollama":
-                yield 'data: ' + json.dumps({"type": "step", "step": "thought", "message": f"🤔 {agent_thought.strip()}"}) + '\n\n'
+                yield sse_step("thought", f"🤔 {agent_thought.strip()}")
 
             if not tool_calls:
                 if model.provider_type == "ollama" and ollama_streamed_content:
@@ -1579,26 +1821,52 @@ class LLMManager:
                 else:
                     final_text = agent_thought or "ОК"
 
-                # Apprentice Mode: запрашиваем одобрение даже для прямых текстовых ответов
-                if mode == "apprentice" and task_id and final_text:
+                # ── Детектор «ответ вместо действия» ──────────────────────
+                # Раньше стандартный цикл принимал описание работы за работу: прогон
+                # b12377c8 вернул код в блоке «я бы вызвал publish_artifact», получил
+                # status=success и ноль артефактов. Здесь — одна корректирующая
+                # попытка, после неё честный статус `stub_response`.
+                if tools and self._detect_stub(final_text) and not stub_retried:
+                    stub_retried = True
+                    yield sse_step(
+                        "stub_retry",
+                        "Модель ответила описанием вместо действия — требую выполнить вызов",
+                    )
+                    messages.append({"role": "assistant", "content": final_text})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "[System: Ты описал действие вместо того, чтобы его выполнить. "
+                            "У тебя есть инструменты — вызови нужный СЕЙЧАС, в этом же ответе. "
+                            "Запрещены формулировки «я бы вызвал», «в реальном окружении я бы», "
+                            "«как LLM я не могу», «вот код, который нужно запустить». "
+                            "Если инструмент недоступен — вызови его и покажи реальную ошибку.]"
+                        ),
+                    })
+                    continue
+
+                if tools and self._detect_stub(final_text):
+                    final_status = "stub_response"
+                    yield sse_step("stub_response", "Модель ответила отказом вместо выполнения задачи")
+                else:
+                    final_status = "success"
+
+                # Подтверждение финального ответа — по уровню доступа, а не «всегда в ученике».
+                if task_id and final_text and permissions_service.requires_approval(level, None):
                     yield 'data: ' + json.dumps({"type": "apprentice_request", "tool": None, "args": None, "response_preview": final_text[:300]}) + '\n\n'
-                    db_session = SessionLocal()
-                    apprentice_session_id = task_id
-                    try:
-                        task_obj = db_session.query(AgentTask).filter(AgentTask.id == task_id).first()
-                        if task_obj and task_obj.conversation_id:
-                            apprentice_session_id = task_obj.conversation_id
-                    finally:
-                        db_session.close()
                     decision_res = await self.execute_apprentice_step(
-                        apprentice_session_id, None, None,
+                        self._apprentice_session_id(task_id), None, None,
                         "Агент хочет отправить финальный ответ", final_text
                     )
                     if decision_res["decision"] == "rejected":
                         final_text = "[Ответ отклонён оператором. Агент завершил работу.]"
-                    elif decision_res["decision"] == "corrected" and decision_res.get("corrected_args"):
-                        # corrected_args здесь нет, но на будущее — можно передать corrected text
-                        pass
+                        final_status = "no_delegation"
+                    elif decision_res["decision"] == "timeout":
+                        final_text = (
+                            f"[Ответ не был подтверждён за {int(permissions_service.WAIT_TIMEOUT_SECONDS // 60)} мин. "
+                            "Прогон завершён без отправки.]\n\n" + final_text
+                        )
+                        final_status = "timeout"
 
                 if model.provider_type == "ollama" and ollama_streamed_content:
                     yield 'data: ' + json.dumps({"type": "result", "content": final_text}) + '\n\n'
@@ -1625,38 +1893,45 @@ class LLMManager:
                     messages.append(self._build_tool_result_msg(model, t_id, tool_name, blocked_text))
                     continue
                     
-                yield 'data: ' + json.dumps({"type": "step", "step": f"tool_{tool_name}", "message": f"Вызов: {tool_name}({json.dumps(tool_args, ensure_ascii=False)})"}) + '\n\n'
-                
+                yield sse_step(
+                    f"tool_{tool_name}",
+                    f"Вызов: {tool_name}({json.dumps(tool_args, ensure_ascii=False)})",
+                    read_only=permissions_service.is_read_only(tool_name),
+                )
+
                 corrected_mark = False
-                if mode == "apprentice" and task_id:
+                if task_id and permissions_service.requires_approval(level, tool_name):
                     # Emit a dedicated event so the frontend renders an approval card
-                    yield 'data: ' + json.dumps({"type": "apprentice_request", "tool": tool_name, "args": tool_args}) + '\n\n'
-                    
-                    db_session = SessionLocal()
-                    apprentice_session_id = task_id
-                    try:
-                        task_obj = db_session.query(AgentTask).filter(AgentTask.id == task_id).first()
-                        if task_obj and task_obj.conversation_id:
-                            apprentice_session_id = task_obj.conversation_id
-                    finally:
-                        db_session.close()
-                    
-                    decision_res = await self.execute_apprentice_step(apprentice_session_id, tool_name, tool_args, f"Хочу вызвать {tool_name}", None)
+                    yield 'data: ' + json.dumps({"type": "apprentice_request", "tool": tool_name, "args": tool_args, "role": task_type}) + '\n\n'
+
+                    decision_res = await self.execute_apprentice_step(
+                        self._apprentice_session_id(task_id), tool_name, tool_args, f"Хочу вызвать {tool_name}", None
+                    )
                     decision = decision_res["decision"]
-                    
+
                     if decision == "rejected":
                         sys_msg = {"role": "user", "content": f"[System: Вызов инструмента {tool_name} был отклонен оператором. Попробуй альтернативный путь решения задачи.]"}
                         messages.append(sys_msg)
-                        yield 'data: ' + json.dumps({"type": "step", "step": "rejected", "message": f"Вызов {tool_name} отклонен. Модель ищет обходной путь."}) + '\n\n'
+                        yield sse_step("rejected", f"Вызов {tool_name} отклонен. Модель ищет обходной путь.")
                         continue
-                    elif decision == "corrected":
+                    if decision == "timeout":
+                        # Молча продолжать нельзя: подтверждения не было, а действие меняет состояние.
+                        final_text = (
+                            f"Вызов «{tool_name}» не подтверждён за "
+                            f"{int(permissions_service.WAIT_TIMEOUT_SECONDS // 60)} мин — действие не выполнено."
+                        )
+                        final_status = "timeout"
+                        yield sse_step("permission_timeout", final_text)
+                        break
+                    if decision == "corrected":
                         if decision_res.get("corrected_args"):
                             tool_args = decision_res["corrected_args"]
                             corrected_mark = True
 
                 try:
                     res = await self._call_tool(tool_name, tool_args, task_type, task_id)
-                    if mode == "apprentice" and corrected_mark:
+                    executed_tool_names.append(tool_name)
+                    if corrected_mark:
                         res = f"[System: Оператор скорректировал твои аргументы для инструмента {tool_name}. Ниже представлен результат выполнения с учетом правок.]\n" + res
                     
                     error_hashes.clear() # Reset on success
@@ -1664,7 +1939,7 @@ class LLMManager:
                     
                     # Truncate response for UI rendering
                     res_preview = res[:200].replace('\n', ' ') + ('...' if len(res) > 200 else '')
-                    yield 'data: ' + json.dumps({"type": "step", "step": f"tool_result_{tool_name}", "message": f"Результат {tool_name}: {res_preview}"}) + '\n\n'
+                    yield sse_step(f"tool_result_{tool_name}", f"Результат {tool_name}: {res_preview}")
 
                     # ── Anti-loop по ПРОГРЕССУ (а не по исключениям) ──────────────
                     # read_file отдаёт {"error": "File not found: ..."} как обычный успешный
@@ -1690,7 +1965,8 @@ class LLMManager:
                             model, t_id, tool_name,
                             res + "\n[System: ОБНАРУЖЕНО ОТСУТСТВИЕ ПРОГРЕССА. Прекрати повторять это действие.]"
                         ))
-                        yield 'data: ' + json.dumps({"type": "step", "step": "no_progress", "message": f"Остановлено: {reason} ({tool_name})"}) + '\n\n'
+                        yield sse_step("no_progress", f"Остановлено: {reason} ({tool_name})")
+                        final_status = "failed"
                         final_text = (
                             f"⚠️ Остановлено на раунде {round_num + 1}: {reason} ({tool_name}). "
                             "Прогресса нет — уточните задачу или проверьте доступность инструмента."
@@ -1712,10 +1988,35 @@ class LLMManager:
             if no_progress_stop:
                 break
 
-        for i in range(0, len(final_text), 5):
-            chunk = final_text[i:i+5]
-            yield 'data: ' + json.dumps({"type": "result", "content": chunk}) + '\n\n'
-            await asyncio.sleep(0.03)
+        # ── Телеметрия исполнителя ────────────────────────────────────
+        # До этого трейс писал только швейцар: на прогон 87304239 в базе было 2 строки
+        # `doorman_chat` и НИ ОДНОЙ от code_architect. Из-за этого аналитика и self-review
+        # не видели работу исполнителя, а журнал мог сказать «success» при нулевом результате.
+        if tools is not None and final_status == "success" and not executed_tool_names:
+            # Модель не вызвала ни одного инструмента там, где они были доступны и задача
+            # сформулирована как поручение, — это не «успех», а отказ от действия.
+            # Ровно инцидент b12377c8 (текст вместо publish_artifact).
+            if self._detect_stub(final_text):
+                final_status = "stub_response"
+            else:
+                try:
+                    from .roles_impl.base_agent import explicit_action_requested
+                    if explicit_action_requested(query):
+                        final_status = "no_delegation"
+                except Exception:  # noqa: BLE001 — эвристика не должна ронять прогон
+                    pass
+
+        try:
+            self._record_trace(
+                None, None, task_type, task_type, model, tools,
+                len(executed_tool_names), executed_tool_names, std_started,
+                final_status, session_id=task_id, task_id=task_id,
+            )
+        except Exception as e:  # noqa: BLE001 — телеметрия не имеет права уронить прогон
+            logger.error(f"Не удалось записать трейс исполнителя {task_type}: {e}")
+
+        async for chunk in stream_result(final_text):
+            yield chunk
 
     async def execute(
         self,

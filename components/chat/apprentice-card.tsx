@@ -1,9 +1,12 @@
 "use client"
 
 import { useState } from "react"
-import { Check, X, Edit, ShieldAlert, AlertTriangle } from "lucide-react"
+import { Check, X, Edit, ShieldAlert, AlertTriangle, ListChecks } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
+
+/** Сентинел бэкенда: шаг «план», а не вызов инструмента (см. services/permissions.py). */
+export const PLAN_TOOL = "__plan__"
 
 export interface ApprenticeStep {
   id: string
@@ -27,7 +30,28 @@ export function ApprenticeCard({ step, onAccept, onReject, onCorrect }: Apprenti
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [elevationRequired, setElevationRequired] = useState(false)
 
+  const isPlan = step.proposed_tool === PLAN_TOOL
+  const planSteps: string[] = Array.isArray(step.proposed_args?.steps)
+    ? (step.proposed_args.steps as string[])
+    : []
+  // План редактируется построчно: человеку понятнее список шагов, чем JSON.
+  const [planText, setPlanText] = useState(planSteps.join("\n"))
+
   const isPrivileged = step.proposed_tool === "run_claude_coder" || step.proposed_tool === "run_terminal_command"
+
+  const handleCorrectPlan = async () => {
+    setIsSubmitting(true)
+    try {
+      const steps = planText
+        .split("\n")
+        .map((s) => s.trim().replace(/^\d+[.)]\s*/, ""))
+        .filter(Boolean)
+        .slice(0, 3)
+      await onCorrect(step.id, { steps }, editedReasoning)
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
 
   const handleAccept = async () => {
     setIsSubmitting(true)
@@ -76,6 +100,82 @@ export function ApprenticeCard({ step, onAccept, onReject, onCorrect }: Apprenti
         <Button variant="outline" className="w-full mt-2 border-red-500 text-red-500 hover:bg-red-500/20" disabled>
           Ожидание проверки безопасности...
         </Button>
+      </div>
+    )
+  }
+
+  // ── План перед действием ──────────────────────────────────────────
+  // Показываем намерение ДО первого инструмента: человек видит 2–3 шага и решает,
+  // пускать ли агента к работе. Раньше первым, что он видел, был уже готовый вызов.
+  if (isPlan) {
+    return (
+      <div className="rounded-xl border border-blue-500/40 bg-blue-500/5 p-4 mb-4 shadow-sm">
+        <div className="flex items-center gap-2 mb-3">
+          <ListChecks className="size-5 text-blue-500" />
+          <h3 className="font-semibold text-sm">Агент предлагает план</h3>
+          <span className="ml-auto text-[10px] uppercase tracking-wide text-muted-foreground">
+            до первого действия
+          </span>
+        </div>
+
+        {!isEditing ? (
+          <ol className="space-y-1.5 text-sm">
+            {planSteps.map((s, i) => (
+              <li key={i} className="flex gap-2 rounded-lg border border-border/50 bg-background/50 px-3 py-2">
+                <span className="font-mono text-xs text-blue-500 shrink-0">{i + 1}.</span>
+                <span className="min-w-0">{s}</span>
+              </li>
+            ))}
+            {planSteps.length === 0 && (
+              <li className="text-sm text-muted-foreground">Модель не сформулировала план.</li>
+            )}
+          </ol>
+        ) : (
+          <div className="space-y-2 text-sm">
+            <label className="font-semibold text-muted-foreground block text-xs">
+              Шаги плана (по одному в строке, максимум 3):
+            </label>
+            <Textarea
+              value={planText}
+              onChange={(e) => setPlanText(e.target.value)}
+              className="text-xs font-mono min-h-24"
+            />
+          </div>
+        )}
+
+        <div className="flex items-center gap-2 mt-4 pt-3 border-t border-border/50">
+          {!isEditing ? (
+            <>
+              <Button
+                onClick={handleAccept}
+                disabled={isSubmitting}
+                size="sm"
+                className="bg-green-600 hover:bg-green-700"
+              >
+                <Check className="size-4 mr-1" />
+                Разрешить выполнение
+              </Button>
+              <Button onClick={() => setIsEditing(true)} disabled={isSubmitting} size="sm" variant="outline">
+                <Edit className="size-4 mr-1" />
+                Изменить план
+              </Button>
+              <Button onClick={handleReject} disabled={isSubmitting} size="sm" variant="destructive" className="ml-auto">
+                <X className="size-4 mr-1" />
+                Отклонить
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button onClick={handleCorrectPlan} disabled={isSubmitting} size="sm" className="bg-blue-600 hover:bg-blue-700 text-white">
+                <Check className="size-4 mr-1" />
+                Утвердить изменённый план
+              </Button>
+              <Button onClick={() => setIsEditing(false)} disabled={isSubmitting} size="sm" variant="ghost">
+                Отмена
+              </Button>
+            </>
+          )}
+        </div>
       </div>
     )
   }

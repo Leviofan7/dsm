@@ -5,6 +5,7 @@ import time
 from database import SessionLocal
 from models import ScenarioDefinition
 from agent.mcp_manager import MCPManager
+from services import permissions as permissions_service
 
 logger = logging.getLogger("contextus.scenario_executor")
 
@@ -16,8 +17,13 @@ class LinearScenarioExecutor:
     async def execute_scenario(self, task_id: str, scenario_id: str, query: str, mode: str = "auto"):
         """
         Исполняет сценарий (последовательность шагов) линейно, без вызова LLM.
-        Если mode == "apprentice", останавливается перед каждым шагом.
+
+        Уровень доступа решает, где останавливаться: `ask` спрашивает только про шаги,
+        которые меняют состояние (read-only шаги идут без остановки), остальные уровни
+        не спрашивают вовсе. Раньше условие было `mode == "apprentice"` — то есть
+        жёстко зашитое имя исторического режима.
         """
+        level = permissions_service.normalize_level(mode)
         db = SessionLocal()
         import hashlib
         try:
@@ -55,8 +61,8 @@ class LinearScenarioExecutor:
 
             yield 'data: ' + json.dumps({"type": "step", "step": f"scenario_step_{i}", "message": f"Сценарий ({i+1}/{len(steps)}): {description}"}) + '\n\n'
             
-            if mode == "apprentice":
-                yield 'data: ' + json.dumps({"type": "step", "step": f"apprentice_pause", "message": f"Apprentice: Ожидание решения по шагу {tool_name}"}) + '\n\n'
+            if permissions_service.requires_approval(level, tool_name):
+                yield 'data: ' + json.dumps({"type": "step", "step": f"apprentice_pause", "message": f"Ожидание подтверждения по шагу {tool_name}"}) + '\n\n'
                 
                 decision_res = await self.llm_manager.execute_apprentice_step(
                     task_id, 
@@ -70,6 +76,9 @@ class LinearScenarioExecutor:
                 if decision == "rejected":
                     yield 'data: ' + json.dumps({"type": "step", "step": "rejected", "message": f"Шаг {tool_name} пропущен оператором."}) + '\n\n'
                     continue
+                elif decision == "timeout":
+                    yield 'data: ' + json.dumps({"type": "step", "step": "permission_timeout", "message": f"Шаг {tool_name} не подтверждён вовремя — сценарий остановлен."}) + '\n\n'
+                    return
                 elif decision == "corrected":
                     if decision_res.get("corrected_args"):
                         tool_args = decision_res["corrected_args"]
